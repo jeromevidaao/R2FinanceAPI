@@ -2,6 +2,7 @@
 
 const sync = require('../lib/sync');
 const ddb = require('../lib/ddb');
+const auth = require('../lib/auth');
 const { ledgerPlanId } = require('../lib/config');
 
 function json(statusCode, body) {
@@ -42,6 +43,58 @@ exports.handler = async (event) => {
         table: ddb.tableName,
         planId: ledgerPlanId,
       });
+    }
+
+    // ── Auth ──────────────────────────────────────────────────────────
+    if (method === 'POST' && path === '/v1/auth/bootstrap') {
+      const user = await auth.ensureUser(auth.ALLOWED_EMAIL);
+      return json(200, {
+        ok: true,
+        email: user.email,
+        mustSetPassword: !!user.mustSetPassword || !user.passwordHash,
+        mfaEnabled: !!user.mfaEnabled,
+      });
+    }
+
+    if (method === 'POST' && path === '/v1/auth/status') {
+      const body = parseBody(event);
+      return json(200, await auth.authStatus(body.email));
+    }
+
+    if (method === 'POST' && path === '/v1/auth/set-password') {
+      const body = parseBody(event);
+      return json(200, await auth.setPassword(body.email, body.password));
+    }
+
+    if (method === 'POST' && path === '/v1/auth/login') {
+      const body = parseBody(event);
+      return json(200, await auth.login(body.email, body.password));
+    }
+
+    if (method === 'POST' && path === '/v1/auth/mfa/setup') {
+      const body = parseBody(event);
+      return json(200, await auth.mfaSetupStart(body.email, body.password));
+    }
+
+    if (method === 'POST' && path === '/v1/auth/mfa/enable') {
+      const body = parseBody(event);
+      return json(
+        200,
+        await auth.mfaSetupConfirm(body.email, body.password, body.code),
+      );
+    }
+
+    if (method === 'POST' && path === '/v1/auth/mfa/verify') {
+      const body = parseBody(event);
+      return json(200, await auth.mfaVerify(body.mfaToken, body.code));
+    }
+
+    if (method === 'GET' && path === '/v1/auth/me') {
+      const hdr = event?.headers?.authorization || event?.headers?.Authorization || '';
+      const token = hdr.replace(/^Bearer\s+/i, '').trim();
+      const session = await auth.validateSession(token);
+      if (!session) return json(401, { error: 'unauthorized' });
+      return json(200, { email: session.email, expiresAt: session.expiresAt });
     }
 
     if (method === 'GET' && path === '/v1/stats') {
@@ -117,6 +170,7 @@ exports.handler = async (event) => {
     return json(404, { error: 'not_found', path, method });
   } catch (e) {
     console.error(e);
-    return json(500, { error: e.message || String(e) });
+    const status = e.status && Number.isInteger(e.status) ? e.status : 500;
+    return json(status, { error: e.message || String(e) });
   }
 };
