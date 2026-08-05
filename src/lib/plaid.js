@@ -116,12 +116,10 @@ async function createLinkToken({
   institutionId,
   bankKey,
 } = {}) {
+  // Plaid rejects redirect_uri with query strings — bank choice is
+  // tracked in the website sessionStorage, not the redirect URL.
   const base = websiteBaseUrl.replace(/\/$/, '');
-  const uri =
-    redirectUri ||
-    (bankKey
-      ? `${base}/connectors?bank=${encodeURIComponent(bankKey)}`
-      : `${base}/connectors`);
+  const uri = redirectUri || `${base}/connectors`;
   const body = {
     user: { client_user_id: String(clientUserId || 'r2finance-user') },
     client_name: 'R2Finance',
@@ -131,29 +129,45 @@ async function createLinkToken({
     redirect_uri: uri,
   };
   if (institutionId) body.institution_id = institutionId;
+  void bankKey; // reserved for logging / future use
 
   try {
     return await plaidPost('/link/token/create', body);
   } catch (e) {
-    // Sandbox / some envs reject institution_id or OAuth redirect — retry looser.
-    if (
+    // Common issues: redirect URI not yet registered in Plaid dashboard,
+    // or institution_id not allowed for this env/plan — retry looser.
+    const msg = e.message || '';
+    const retryable =
       e.code === 'INVALID_FIELD' ||
       e.code === 'INVALID_INPUT' ||
-      /institution|redirect/i.test(e.message || '')
-    ) {
-      const fallback = {
+      /institution|redirect/i.test(msg);
+    if (!retryable) throw e;
+
+    // 1) Drop institution preselect, keep redirect if it wasn't the problem
+    const step1 = {
+      user: body.user,
+      client_name: body.client_name,
+      products: body.products,
+      country_codes: body.country_codes,
+      language: body.language,
+    };
+    if (!/redirect/i.test(msg)) step1.redirect_uri = uri;
+    try {
+      return await plaidPost('/link/token/create', step1);
+    } catch (e2) {
+      // 2) Minimal token (no redirect) — works once keys are valid;
+      //    BoA/Chase OAuth still needs redirect registered for full flow.
+      if (!/redirect|institution/i.test(e2.message || '') && e2.code !== 'INVALID_FIELD') {
+        throw e2;
+      }
+      return await plaidPost('/link/token/create', {
         user: body.user,
         client_name: body.client_name,
         products: body.products,
         country_codes: body.country_codes,
         language: body.language,
-      };
-      if (!/redirect/i.test(e.message || '')) {
-        fallback.redirect_uri = uri;
-      }
-      return await plaidPost('/link/token/create', fallback);
+      });
     }
-    throw e;
   }
 }
 

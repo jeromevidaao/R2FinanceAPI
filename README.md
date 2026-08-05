@@ -65,10 +65,8 @@ Establishes read access to **Bank of America** and **Chase** (credit cards / dep
 **Does not** write bank transactions into DynamoDB ledger `TXN#` rows yet.
 
 1. Create a Plaid account → Dashboard API keys.
-2. Register OAuth redirect URIs:
+2. Register OAuth redirect URI (no query string — Plaid rejects those):
    - `https://finance.i-liquid.be/connectors`
-   - `https://finance.i-liquid.be/connectors?bank=boa`
-   - `https://finance.i-liquid.be/connectors?bank=chase`
 3. Put credentials in Secrets Manager:
 
 ```bash
