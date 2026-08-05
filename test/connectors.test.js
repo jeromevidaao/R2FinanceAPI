@@ -6,15 +6,20 @@ const plaid = require('../src/lib/plaid');
 const connectors = require('../src/lib/connectors');
 
 describe('Plaid / bank connector helpers', () => {
-  it('exports Bank of America and Chase institution ids', () => {
+  it('exports Bank of America, Chase, and Vanguard institution ids', () => {
     assert.equal(plaid.BOA_INSTITUTION_ID, 'ins_127989');
     assert.equal(plaid.CHASE_INSTITUTION_ID, 'ins_56');
+    assert.equal(plaid.VANGUARD_INSTITUTION_ID, 'ins_115616');
   });
 
-  it('resolves boa and chase banks', () => {
+  it('resolves boa, chase, and vanguard banks', () => {
     assert.equal(connectors.resolveBank('boa').name, 'Bank of America');
     assert.equal(connectors.resolveBank('chase').name, 'Chase');
     assert.equal(connectors.resolveBank('CHASE').id, 'chase');
+    assert.equal(connectors.resolveBank('vanguard').name, 'Vanguard');
+    assert.deepEqual(connectors.resolveBank('vanguard').products, [
+      'investments',
+    ]);
   });
 
   it('rejects unknown connector', () => {

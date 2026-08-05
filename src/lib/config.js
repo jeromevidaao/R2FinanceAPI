@@ -29,4 +29,7 @@ module.exports = {
   /** Connected Chase item access_token — SSM SecureString. */
   chaseItemSsmParam:
     process.env.CHASE_ITEM_SSM_PARAM || '/r2finance/connectors/chase',
+  /** Connected Vanguard item access_token — SSM SecureString. */
+  vanguardItemSsmParam:
+    process.env.VANGUARD_ITEM_SSM_PARAM || '/r2finance/connectors/vanguard',
 };

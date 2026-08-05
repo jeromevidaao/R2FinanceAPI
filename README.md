@@ -51,17 +51,17 @@ Phone (Room)  ──POST /v1/device/push──►  DynamoDB  ──pushPending /
 | POST | `/v1/auth/reset-password` | Set new password with token from email |
 | POST | `/v1/auth/invite` | Admin session only — create user + email set-password (CC admin) |
 | GET | `/v1/connectors` | List bank connector statuses (session required) |
-| GET | `/v1/connectors/{boa\|chase}` | Connection status for one bank |
-| POST | `/v1/connectors/{boa\|chase}/link-token` | Create Plaid Link token |
-| POST | `/v1/connectors/{boa\|chase}/exchange` | Exchange public_token → store access |
-| GET | `/v1/connectors/{boa\|chase}/accounts` | Live probe accounts/balances (not DDB ledger) |
-| POST | `/v1/connectors/{boa\|chase}/disconnect` | Remove Plaid item + clear stored token |
+| GET | `/v1/connectors/{boa\|chase\|vanguard}` | Connection status for one bank |
+| POST | `/v1/connectors/{boa\|chase\|vanguard}/link-token` | Create Plaid Link token |
+| POST | `/v1/connectors/{boa\|chase\|vanguard}/exchange` | Exchange public_token → store access |
+| GET | `/v1/connectors/{boa\|chase\|vanguard}/accounts` | Live probe accounts/balances (not DDB ledger) |
+| POST | `/v1/connectors/{boa\|chase\|vanguard}/disconnect` | Remove Plaid item + clear stored token |
 
 Password / invite mail is sent from **`no-reply@i-liquid.be`** (SES + DKIM on `i-liquid.be`).
 
-### Bank connectors (Plaid) — BoA + Chase
+### Bank connectors (Plaid) — BoA + Chase + Vanguard
 
-Establishes read access to **Bank of America** and **Chase** (credit cards / deposits) via [Plaid Link](https://plaid.com).  
+Establishes read access to **Bank of America**, **Chase** (credit cards / deposits), and **Vanguard** (investments) via [Plaid Link](https://plaid.com).  
 **Does not** write bank transactions into DynamoDB ledger `TXN#` rows yet.
 
 **Plaid keys never live in git.** They are SSM SecureString parameters only.
@@ -79,10 +79,11 @@ aws ssm put-parameter --name /r2finance/plaid --type SecureString \
 # env: sandbox | development | production
 ```
 
-4. On the website: **Connectors → Connect Bank of America / Connect Chase**.
+4. On the website: **Connectors → Connect Bank of America / Chase / Vanguard**.
 5. Item access tokens (written after Link succeeds):
    - BoA → SSM `/r2finance/connectors/boa`
    - Chase → SSM `/r2finance/connectors/chase`
+   - Vanguard → SSM `/r2finance/connectors/vanguard`
 
 ## Deploy
 

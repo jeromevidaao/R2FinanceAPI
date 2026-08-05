@@ -22,10 +22,13 @@ const HOSTS = {
 const INSTITUTIONS = {
   boa: { id: 'ins_127989', name: 'Bank of America' },
   chase: { id: 'ins_56', name: 'Chase' },
+  /** Brokerage / retirement — investments product. */
+  vanguard: { id: 'ins_115616', name: 'Vanguard' },
 };
 
 const BOA_INSTITUTION_ID = INSTITUTIONS.boa.id;
 const CHASE_INSTITUTION_ID = INSTITUTIONS.chase.id;
+const VANGUARD_INSTITUTION_ID = INSTITUTIONS.vanguard.id;
 
 let credsCache;
 
@@ -125,15 +128,20 @@ async function createLinkToken({
   redirectUri,
   institutionId,
   bankKey,
+  products,
 } = {}) {
   // Plaid rejects redirect_uri with query strings — bank choice is
   // tracked in the website sessionStorage, not the redirect URL.
   const base = websiteBaseUrl.replace(/\/$/, '');
   const uri = redirectUri || `${base}/connectors`;
+  const productList =
+    Array.isArray(products) && products.length
+      ? products
+      : ['transactions'];
   const body = {
     user: { client_user_id: String(clientUserId || 'r2finance-user') },
     client_name: 'R2Finance',
-    products: ['transactions'],
+    products: productList,
     country_codes: ['US'],
     language: 'en',
     redirect_uri: uri,
@@ -150,7 +158,7 @@ async function createLinkToken({
     const retryable =
       e.code === 'INVALID_FIELD' ||
       e.code === 'INVALID_INPUT' ||
-      /institution|redirect/i.test(msg);
+      /institution|redirect|product/i.test(msg);
     if (!retryable) throw e;
 
     // 1) Drop institution preselect, keep redirect if it wasn't the problem
@@ -166,14 +174,21 @@ async function createLinkToken({
       return await plaidPost('/link/token/create', step1);
     } catch (e2) {
       // 2) Minimal token (no redirect) — works once keys are valid;
-      //    BoA/Chase OAuth still needs redirect registered for full flow.
-      if (!/redirect|institution/i.test(e2.message || '') && e2.code !== 'INVALID_FIELD') {
+      //    OAuth institutions still need redirect registered for full flow.
+      if (
+        !/redirect|institution|product/i.test(e2.message || '') &&
+        e2.code !== 'INVALID_FIELD'
+      ) {
         throw e2;
       }
+      // If investments product fails on plan, fall back to transactions.
+      const fallbackProducts = body.products.includes('investments')
+        ? ['transactions']
+        : body.products;
       return await plaidPost('/link/token/create', {
         user: body.user,
         client_name: body.client_name,
-        products: body.products,
+        products: fallbackProducts,
         country_codes: body.country_codes,
         language: body.language,
       });
@@ -237,6 +252,7 @@ module.exports = {
   INSTITUTIONS,
   BOA_INSTITUTION_ID,
   CHASE_INSTITUTION_ID,
+  VANGUARD_INSTITUTION_ID,
   getPlaidCreds,
   clearPlaidCache,
   createLinkToken,

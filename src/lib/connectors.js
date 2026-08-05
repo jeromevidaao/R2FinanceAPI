@@ -18,6 +18,7 @@ const plaid = require('./plaid');
 const {
   boaItemSsmParam,
   chaseItemSsmParam,
+  vanguardItemSsmParam,
   ledgerPlanId,
 } = require('./config');
 
@@ -41,6 +42,7 @@ const BANKS = {
     /** SSM SecureString path for Plaid item access_token — never in git. */
     ssmParam: boaItemSsmParam,
     short: 'BoA',
+    products: ['transactions'],
   },
   chase: {
     id: 'chase',
@@ -49,8 +51,20 @@ const BANKS = {
     sk: 'CONNECTOR#CHASE',
     ssmParam: chaseItemSsmParam,
     short: 'Chase',
+    products: ['transactions'],
+  },
+  vanguard: {
+    id: 'vanguard',
+    name: 'Vanguard',
+    institutionId: plaid.VANGUARD_INSTITUTION_ID,
+    sk: 'CONNECTOR#VANGUARD',
+    ssmParam: vanguardItemSsmParam,
+    short: 'VG',
+    // Brokerage / retirement accounts
+    products: ['investments'],
   },
 };
+
 
 function resolveBank(bankId) {
   const key = String(bankId || '')
@@ -310,6 +324,7 @@ async function createLinkToken(bankId, { email } = {}) {
     clientUserId: plaidClientUserId(email),
     institutionId: bank.institutionId,
     bankKey: bank.id,
+    products: bank.products || ['transactions'],
   });
 }
 
@@ -324,4 +339,5 @@ module.exports = {
   createLinkToken,
   CONNECTOR_SK_BOA: BANKS.boa.sk,
   CONNECTOR_SK_CHASE: BANKS.chase.sk,
+  CONNECTOR_SK_VANGUARD: BANKS.vanguard.sk,
 };
