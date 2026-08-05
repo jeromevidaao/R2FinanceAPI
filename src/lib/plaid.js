@@ -24,11 +24,14 @@ const INSTITUTIONS = {
   chase: { id: 'ins_56', name: 'Chase' },
   /** Brokerage / retirement — investments product. */
   vanguard: { id: 'ins_115616', name: 'Vanguard' },
+  /** Venmo Personal balance / payments. */
+  venmo: { id: 'ins_132083', name: 'Venmo' },
 };
 
 const BOA_INSTITUTION_ID = INSTITUTIONS.boa.id;
 const CHASE_INSTITUTION_ID = INSTITUTIONS.chase.id;
 const VANGUARD_INSTITUTION_ID = INSTITUTIONS.vanguard.id;
+const VENMO_INSTITUTION_ID = INSTITUTIONS.venmo.id;
 
 let credsCache;
 
@@ -253,6 +256,7 @@ module.exports = {
   BOA_INSTITUTION_ID,
   CHASE_INSTITUTION_ID,
   VANGUARD_INSTITUTION_ID,
+  VENMO_INSTITUTION_ID,
   getPlaidCreds,
   clearPlaidCache,
   createLinkToken,

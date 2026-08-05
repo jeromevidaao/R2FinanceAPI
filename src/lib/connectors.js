@@ -84,6 +84,14 @@ const BANKS = {
     short: 'VG',
     products: ['investments'],
   },
+  venmo: {
+    id: 'venmo',
+    name: 'Venmo',
+    institutionId: plaid.VENMO_INSTITUTION_ID,
+    bankSk: 'CONNECTOR#VENMO',
+    short: 'Venmo',
+    products: ['transactions'],
+  },
 };
 
 function resolveBank(bankId) {

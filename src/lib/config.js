@@ -25,7 +25,7 @@ module.exports = {
   plaidEnv: process.env.PLAID_ENV || 'sandbox',
   /**
    * Per-user item tokens:
-   *   /r2finance/connectors/{userKey}/{boa|chase|vanguard}
+   *   /r2finance/connectors/{userKey}/{boa|chase|vanguard|venmo}
    * userKey = sha256("r2u:"+email).slice(0,16) — no email in the path.
    */
 };

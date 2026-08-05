@@ -283,8 +283,8 @@ exports.handler = async (event) => {
 
     // ── Bank connectors (Plaid) — per signed-in email ─────────────────
     // Access only — never write bank transactions into DDB ledger TXN#.
-    // Supported banks: boa, chase, vanguard (see connectors.BANKS).
-    // Each household member has their own set (2× BoA, 2× Chase, 2× VG).
+    // Supported banks: boa, chase, vanguard, venmo (see connectors.BANKS).
+    // Each household member has their own set (2× each bank type).
     if (method === 'GET' && path === '/v1/connectors') {
       const session = await requireSession(event);
       const qs = event?.queryStringParameters || {};

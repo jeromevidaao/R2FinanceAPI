@@ -61,8 +61,8 @@ Password / invite mail is sent from **`no-reply@i-liquid.be`** (SES + DKIM on `i
 
 ### Bank connectors (Plaid) — per email × bank
 
-Generic bank catalog: **Bank of America**, **Chase**, **Vanguard**.  
-Each **household member** (signed-in email) has their own independent links — so the household can have 2× BoA, 2× Chase, 2× Vanguard.
+Generic bank catalog: **Bank of America**, **Chase**, **Vanguard**, **Venmo**.  
+Each **household member** (signed-in email) has their own independent links — so the household can have 2× each bank type.
 
 | Layer | Keying |
 |-------|--------|
@@ -87,7 +87,7 @@ aws ssm put-parameter --name /r2finance/plaid --type SecureString \
 ```
 
 4. Each person signs in → **Connectors** → links their own banks.
-5. Item tokens: SSM `/r2finance/connectors/{userKey}/{boa|chase|vanguard}`.
+5. Item tokens: SSM `/r2finance/connectors/{userKey}/{boa|chase|vanguard|venmo}`.
 6. Household matrix: `GET /v1/connectors?household=1`.
 
 ## Deploy
