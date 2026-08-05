@@ -1,21 +1,13 @@
-/**
- * R2FinanceYnabPush — drain PENDING_PUSH from DDB → YNAB POST/PATCH.
- * Phase 1 stub. Respect 200 req/h rate limit when implemented.
- */
+'use strict';
 
-const RESOURCE = {
-  lambda: 'R2FinanceYnabPush',
-  table: 'R2Finance',
-  secret: 'R2Finance/ynab-pat',
-  rateLimitPerHour: 200,
-};
+const sync = require('../lib/sync');
 
+/** R2FinanceYnabPush — drain PENDING_PUSH → YNAB. */
 exports.handler = async (event) => {
-  console.log(JSON.stringify({ msg: 'R2FinanceYnabPush stub', resource: RESOURCE, eventKeys: Object.keys(event || {}) }));
-  return {
-    ok: true,
-    phase: 1,
-    pushed: 0,
-    message: 'Implement category/txn push + 429 backoff in Phase 3',
-  };
+  console.log(JSON.stringify({ msg: 'R2FinanceYnabPush start' }));
+  const result = await sync.pushPending({
+    limit: event?.limit || 40,
+  });
+  console.log(JSON.stringify(result));
+  return { ok: true, ...result };
 };

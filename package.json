@@ -1,14 +1,21 @@
 {
   "name": "r2finance-api",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "R2Finance AWS Lambda + DynamoDB API (low cost)",
+  "description": "R2Finance AWS API — Lambda + DynamoDB + YNAB bidirectional sync",
   "main": "src/handlers/apiHandler.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "lint": "node -c src/handlers/apiHandler.js && node -c src/handlers/ynabPull.js && node -c src/handlers/ynabPush.js"
+    "lint": "node -c src/lib/ynab.js && node -c src/lib/ddb.js && node -c src/lib/sync.js && node -c src/handlers/apiHandler.js && node -c src/handlers/ynabPull.js && node -c src/handlers/ynabPush.js && node -c src/handlers/fullImport.js",
+    "deploy": "bash scripts/deploy.sh",
+    "import": "bash scripts/invoke-import.sh"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.758.0",
+    "@aws-sdk/client-secrets-manager": "^3.758.0",
+    "@aws-sdk/lib-dynamodb": "^3.758.0"
   }
 }

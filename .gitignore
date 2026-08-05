@@ -5,3 +5,6 @@ node_modules/
 .aws-sam/
 dist/
 coverage/
+.api-endpoint
+*.zip
+node_modules/
