@@ -226,18 +226,26 @@ async function createSession(email) {
 
 /**
  * Validate bearer session. Rejects expired tokens and any email not on
- * the hard allow-list (Jerome + Ngoc only).
+ * the hard allow-list (Jerome + Ngoc only). Fail closed on storage errors.
  */
 async function validateSession(token) {
   if (!token) return null;
-  const out = await ddb.ddb.send(
-    new GetCommand({ TableName: tableName, Key: sessionKey(token) }),
-  );
-  const s = out.Item;
-  if (!s || !s.expiresAt || s.expiresAt < Date.now()) return null;
-  const e = normalizeEmail(s.email);
-  if (!isAllowedEmail(e)) return null;
-  return { ...s, email: e };
+  try {
+    const out = await ddb.ddb.send(
+      new GetCommand({ TableName: tableName, Key: sessionKey(token) }),
+    );
+    const s = out.Item;
+    if (!s || !s.expiresAt || s.expiresAt < Date.now()) return null;
+    const e = normalizeEmail(s.email);
+    if (!isAllowedEmail(e)) return null;
+    return { ...s, email: e };
+  } catch (err) {
+    console.error(
+      'validateSession storage error',
+      err && err.message ? err.message : err,
+    );
+    return null;
+  }
 }
 
 async function login(email, password) {
