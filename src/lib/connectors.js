@@ -11,6 +11,7 @@
  *  - Do NOT write bank transactions into DDB TXN# / ledger rows
  */
 
+const crypto = require('crypto');
 const ddb = require('./ddb');
 const ssm = require('./ssm');
 const plaid = require('./plaid');
@@ -19,6 +20,16 @@ const {
   chaseItemSsmParam,
   ledgerPlanId,
 } = require('./config');
+
+/**
+ * Plaid forbids emails/PII in user.client_user_id — use a stable hash instead.
+ */
+function plaidClientUserId(email) {
+  const raw = String(email || 'r2finance')
+    .trim()
+    .toLowerCase();
+  return crypto.createHash('sha256').update(`r2finance:${raw}`).digest('hex').slice(0, 32);
+}
 
 /** Supported bank connectors (access-only). */
 const BANKS = {
@@ -296,7 +307,7 @@ async function disconnect(bankId, planId = ledgerPlanId) {
 async function createLinkToken(bankId, { email } = {}) {
   const bank = resolveBank(bankId);
   return plaid.createLinkToken({
-    clientUserId: email || 'r2finance',
+    clientUserId: plaidClientUserId(email),
     institutionId: bank.institutionId,
     bankKey: bank.id,
   });
