@@ -143,14 +143,18 @@ exports.handler = async (event) => {
     if (method === 'GET' && path === '/v1/accounts') {
       const items = await ddb.queryPk(ddb.planPk(), 'ACCT#');
       return json(200, {
-        accounts: items.map((i) => ({
-          ynabId: i.ynabId,
-          name: i.name,
-          type: i.type,
-          balance: i.balance,
-          onBudget: i.onBudget,
-          closed: i.closed,
-        })),
+        accounts: items
+          .filter((i) => !i.deleted && !i.closed)
+          .map((i) => ({
+            ynabId: i.ynabId,
+            name: i.name,
+            type: i.type,
+            balance: i.balance ?? i.payload?.balance ?? 0,
+            onBudget: i.onBudget ?? i.payload?.on_budget ?? true,
+            closed: i.closed ?? i.payload?.closed ?? false,
+            note: i.payload?.note ?? null,
+            transferPayeeId: i.payload?.transfer_payee_id ?? null,
+          })),
       });
     }
 
@@ -158,12 +162,82 @@ exports.handler = async (event) => {
       const groups = await ddb.queryPk(ddb.planPk(), 'CGRP#');
       const cats = await ddb.queryPk(ddb.planPk(), 'CAT#');
       return json(200, {
-        groups: groups.map((g) => ({ ynabId: g.ynabId, name: g.name })),
-        categories: cats.map((c) => ({
-          ynabId: c.ynabId,
-          name: c.name,
-          categoryGroupId: c.categoryGroupId,
-        })),
+        groups: groups
+          .filter((g) => !g.deleted)
+          .map((g) => ({
+            ynabId: g.ynabId,
+            name: g.name,
+            hidden: g.hidden ?? false,
+          })),
+        categories: cats
+          .filter((c) => !c.deleted)
+          .map((c) => ({
+            ynabId: c.ynabId,
+            name: c.name,
+            categoryGroupId: c.categoryGroupId,
+            hidden: c.hidden ?? false,
+          })),
+      });
+    }
+
+    if (method === 'GET' && path === '/v1/payees') {
+      const items = await ddb.queryPk(ddb.planPk(), 'PAYEE#');
+      return json(200, {
+        payees: items
+          .filter((p) => !p.deleted)
+          .map((p) => ({
+            ynabId: p.ynabId,
+            name: p.name,
+            transferAccountId: p.transferAccountId ?? p.payload?.transfer_account_id ?? null,
+          })),
+      });
+    }
+
+    if (method === 'GET' && path === '/v1/transactions') {
+      const items = await ddb.queryPk(ddb.planPk(), 'TXN#');
+      const qs = event?.queryStringParameters || {};
+      const openOnly = qs.open_accounts !== '0';
+      // Map closed accounts if needed — return all non-deleted for hydrate
+      return json(200, {
+        transactions: items
+          .filter((t) => !t.deleted)
+          .map((t) => {
+            const p = t.payload || {};
+            return {
+              ynabId: t.ynabId,
+              accountId: t.accountId || p.account_id,
+              date: t.date || p.date,
+              amount: t.amount ?? p.amount,
+              payeeId: t.payeeId ?? p.payee_id ?? null,
+              categoryId: t.categoryId ?? p.category_id ?? null,
+              memo: t.memo ?? p.memo ?? null,
+              cleared: t.cleared || p.cleared || 'uncleared',
+              approved: t.approved ?? p.approved ?? true,
+              flagColor: p.flag_color || null,
+              transferAccountId: p.transfer_account_id || null,
+              transferTransactionId: p.transfer_transaction_id || null,
+              importId: p.import_id || null,
+              subtransactions: (p.subtransactions || []).map((s) => ({
+                ynabId: s.id,
+                amount: s.amount,
+                payeeId: s.payee_id || null,
+                categoryId: s.category_id || null,
+                memo: s.memo || null,
+              })),
+            };
+          }),
+      });
+    }
+
+    if (method === 'GET' && path === '/v1/plan') {
+      const meta = await ddb.getItem(ddb.planPk(), 'META');
+      return json(200, {
+        plan: {
+          name: meta?.payload?.name || meta?.name || 'Plan',
+          ynabPlanId: meta?.ynabPlanId || meta?.payload?.ynabPlanId,
+          currency: meta?.payload?.currency || 'USD',
+          serverKnowledge: meta?.serverKnowledge ?? 0,
+        },
       });
     }
 
