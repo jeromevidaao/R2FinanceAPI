@@ -4,6 +4,7 @@ const sync = require('../lib/sync');
 const ddb = require('../lib/ddb');
 const auth = require('../lib/auth');
 const connectors = require('../lib/connectors');
+const fcm = require('../lib/fcm');
 const { ledgerPlanId } = require('../lib/config');
 
 function json(statusCode, body) {
@@ -12,7 +13,8 @@ function json(statusCode, body) {
     headers: {
       'content-type': 'application/json',
       'access-control-allow-origin': '*',
-      'access-control-allow-headers': 'authorization,content-type',
+      'access-control-allow-headers':
+        'authorization,content-type,x-r2finance-client,x-client',
       'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
     },
     body: JSON.stringify(body),
@@ -25,6 +27,71 @@ function parseBody(event) {
     return typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
   } catch {
     return {};
+  }
+}
+
+function header(event, name) {
+  const h = event?.headers || {};
+  const want = name.toLowerCase();
+  for (const [k, v] of Object.entries(h)) {
+    if (String(k).toLowerCase() === want) return v;
+  }
+  return undefined;
+}
+
+function clientIp(event) {
+  const xf = header(event, 'x-forwarded-for');
+  if (xf) return String(xf).split(',')[0].trim();
+  return (
+    event?.requestContext?.http?.sourceIp ||
+    event?.requestContext?.identity?.sourceIp ||
+    null
+  );
+}
+
+/**
+ * Resolve client label for login alerts: body.client | header | user-agent.
+ * @returns {'android'|'web'|'unknown'|string}
+ */
+function resolveClient(event, body = {}) {
+  const fromBody = String(body.client || body.source || '')
+    .trim()
+    .toLowerCase();
+  if (fromBody === 'android' || fromBody === 'web' || fromBody === 'ios') {
+    return fromBody;
+  }
+  const hdr = String(
+    header(event, 'x-r2finance-client') || header(event, 'x-client') || '',
+  )
+    .trim()
+    .toLowerCase();
+  if (hdr === 'android' || hdr === 'web' || hdr === 'ios') return hdr;
+  const ua = String(header(event, 'user-agent') || '').toLowerCase();
+  if (ua.includes('okhttp') || ua.includes('r2financeandroid')) return 'android';
+  if (ua.includes('mozilla') || ua.includes('chrome') || ua.includes('safari')) {
+    return 'web';
+  }
+  return fromBody || 'unknown';
+}
+
+/**
+ * Fire FCM sign-in alert after a session token is issued.
+ * Awaits FCM so the push goes out before the client finishes navigating,
+ * but never fails the login response.
+ */
+async function maybeNotifySignIn(event, body, authResult) {
+  if (!authResult || !authResult.ok || !authResult.token || !authResult.email) {
+    return;
+  }
+  try {
+    await fcm.notifySignIn({
+      email: authResult.email,
+      client: resolveClient(event, body),
+      ip: clientIp(event),
+      userAgent: header(event, 'user-agent') || null,
+    });
+  } catch (e) {
+    console.error('maybeNotifySignIn', e && e.message ? e.message : e);
   }
 }
 
@@ -86,7 +153,9 @@ exports.handler = async (event) => {
 
     if (method === 'POST' && path === '/v1/auth/login') {
       const body = parseBody(event);
-      return json(200, await auth.login(body.email, body.password));
+      const result = await auth.login(body.email, body.password);
+      await maybeNotifySignIn(event, body, result);
+      return json(200, result);
     }
 
     if (method === 'POST' && path === '/v1/auth/mfa/setup') {
@@ -96,15 +165,20 @@ exports.handler = async (event) => {
 
     if (method === 'POST' && path === '/v1/auth/mfa/enable') {
       const body = parseBody(event);
-      return json(
-        200,
-        await auth.mfaSetupConfirm(body.email, body.password, body.code),
+      const result = await auth.mfaSetupConfirm(
+        body.email,
+        body.password,
+        body.code,
       );
+      await maybeNotifySignIn(event, body, result);
+      return json(200, result);
     }
 
     if (method === 'POST' && path === '/v1/auth/mfa/verify') {
       const body = parseBody(event);
-      return json(200, await auth.mfaVerify(body.mfaToken, body.code));
+      const result = await auth.mfaVerify(body.mfaToken, body.code);
+      await maybeNotifySignIn(event, body, result);
+      return json(200, result);
     }
 
     if (method === 'GET' && path === '/v1/auth/me') {

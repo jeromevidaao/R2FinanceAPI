@@ -47,6 +47,8 @@ Phone (Room)  ──POST /v1/device/push──►  DynamoDB  ──pushPending /
 | POST | `/v1/device/push` | **Phone → DDB** offline queue (no YNAB wait) |
 | POST | `/v1/transactions/categorize` | Categorize in DDB → push YNAB |
 | POST | `/v1/transactions/approve` | Approve in DDB → push YNAB |
+| POST | `/v1/auth/login` | Password login; **on session issued** → FCM sign-in alert to topic `r2finance_updates` |
+| POST | `/v1/auth/mfa/verify` | MFA complete → session + same FCM sign-in alert |
 | POST | `/v1/auth/forgot-password` | Email one-time reset link → finance.i-liquid.be |
 | POST | `/v1/auth/reset-password` | Set new password with token from email |
 | POST | `/v1/auth/invite` | Admin session only — create user + email set-password (CC admin) |
