@@ -326,11 +326,33 @@ async function deltaPull() {
     lastKnowledge: last,
   });
   knowledge = Math.max(knowledge, txnsR.serverKnowledge);
+
+  // Never clobber local categorize/approve that is waiting to push to YNAB.
+  // Tick order is pull-then-push; without this, a PENDING_PUSH row would be
+  // overwritten by the older YNAB snapshot and the push would no-op.
+  const pendingSk = new Set();
+  try {
+    const pending = await ddb.queryPendingPush(200);
+    for (const p of pending) {
+      if (p.pk === ddb.planPk(planId) && String(p.sk || '').startsWith('TXN#')) {
+        pendingSk.add(p.sk);
+      }
+    }
+  } catch {
+    // Best-effort; proceed without skip set.
+  }
+
+  let skippedPending = 0;
   for (const t of txnsR.transactions) {
+    const sk = `TXN#${t.id}`;
+    if (pendingSk.has(sk)) {
+      skippedPending += 1;
+      continue;
+    }
     items.push(
       entityItem({
         planId,
-        sk: `TXN#${t.id}`,
+        sk,
         entityType: 'transaction',
         ynabId: t.id,
         payload: t,
@@ -393,6 +415,7 @@ async function deltaPull() {
     previousKnowledge: last,
     serverKnowledge: knowledge,
     itemsUpserted: items.length,
+    skippedPendingPush: skippedPending,
   };
 }
 

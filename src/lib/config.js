@@ -9,4 +9,11 @@ module.exports = {
   ledgerPlanId: process.env.R2FINANCE_PLAN_ID || 'default',
   gsi1: 'R2Finance-GSI1-YnabId',
   gsi2: 'R2Finance-GSI2-UpdatedAt',
+  /** Public website used in password-reset emails. */
+  websiteBaseUrl:
+    process.env.R2FINANCE_WEBSITE_URL || 'https://finance.i-liquid.be',
+  /** Verified SES identity (From). */
+  resetFromEmail: process.env.R2FINANCE_RESET_FROM || 'jerome.ans@gmail.com',
+  /** Password-reset token lifetime (ms). */
+  resetTokenTtlMs: Number(process.env.R2FINANCE_RESET_TTL_MS || 60 * 60 * 1000),
 };

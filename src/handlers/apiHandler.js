@@ -97,6 +97,19 @@ exports.handler = async (event) => {
       return json(200, { email: session.email, expiresAt: session.expiresAt });
     }
 
+    if (method === 'POST' && path === '/v1/auth/forgot-password') {
+      const body = parseBody(event);
+      return json(200, await auth.requestPasswordReset(body.email));
+    }
+
+    if (method === 'POST' && path === '/v1/auth/reset-password') {
+      const body = parseBody(event);
+      return json(
+        200,
+        await auth.resetPasswordWithToken(body.token, body.password),
+      );
+    }
+
     if (method === 'GET' && path === '/v1/stats') {
       return json(200, await sync.stats());
     }

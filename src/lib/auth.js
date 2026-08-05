@@ -3,10 +3,17 @@
 const crypto = require('crypto');
 const ddb = require('./ddb');
 const { PutCommand, GetCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
-const { tableName } = require('./config');
+const {
+  tableName,
+  websiteBaseUrl,
+  resetTokenTtlMs,
+} = require('./config');
+const { sendEmail } = require('./email');
 
 const ALLOWED_EMAIL = 'jerome.ans@gmail.com';
-const SESSION_DAYS = 30;
+/** Long-lived so OTA updates never force password+MFA for months. */
+const SESSION_DAYS = 180;
+const RESET_COOLDOWN_MS = 60 * 1000;
 
 function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase();
@@ -312,6 +319,172 @@ async function mfaVerify(mfaToken, code) {
   return { ok: true, ...session, email: pending.email };
 }
 
+function resetKey(token) {
+  return { pk: `RESET#${token}`, sk: 'META' };
+}
+
+/**
+ * Request a password reset email. Always returns a generic success for allowed
+ * emails (and a soft message for others) so callers get a clear UX without
+ * leaking extra account state beyond the private allow-list.
+ */
+async function requestPasswordReset(email) {
+  const e = normalizeEmail(email);
+  if (e !== ALLOWED_EMAIL) {
+    // Generic response — do not reveal allow-list membership in detail
+    return {
+      ok: true,
+      message:
+        'If that email can reset a password, a link was sent. Check your inbox.',
+    };
+  }
+
+  const user = await ensureUser(e);
+  const now = Date.now();
+  if (
+    user.lastResetEmailAt &&
+    now - Number(user.lastResetEmailAt) < RESET_COOLDOWN_MS
+  ) {
+    return {
+      ok: true,
+      message:
+        'If that email can reset a password, a link was sent. Check your inbox.',
+      throttled: true,
+    };
+  }
+
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = now + resetTokenTtlMs;
+  await ddb.ddb.send(
+    new PutCommand({
+      TableName: tableName,
+      Item: {
+        ...resetKey(token),
+        entityType: 'password_reset',
+        email: e,
+        expiresAt,
+        createdAt: now,
+        used: false,
+      },
+    }),
+  );
+
+  await putUser({
+    ...user,
+    lastResetEmailAt: now,
+    updatedAt: now,
+  });
+
+  const base = String(websiteBaseUrl || 'https://finance.i-liquid.be').replace(
+    /\/$/,
+    '',
+  );
+  const link = `${base}/reset-password?token=${encodeURIComponent(token)}`;
+  const minutes = Math.max(1, Math.round(resetTokenTtlMs / 60000));
+
+  const text = [
+    'R2Finance password reset',
+    '',
+    'Someone requested a password reset for your R2Finance account.',
+    `Open this link on the R2Finance website to choose a new password (expires in ${minutes} minutes):`,
+    '',
+    link,
+    '',
+    'If you did not request this, you can ignore this email.',
+  ].join('\n');
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.5;color:#111">
+      <h2 style="margin:0 0 12px">R2Finance password reset</h2>
+      <p>Someone requested a password reset for your R2Finance account.</p>
+      <p>
+        <a href="${link}" style="display:inline-block;background:#2a9f6f;color:#fff;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:600">
+          Reset password on finance.i-liquid.be
+        </a>
+      </p>
+      <p style="color:#555;font-size:14px">This link expires in ${minutes} minutes.</p>
+      <p style="color:#555;font-size:13px;word-break:break-all">${link}</p>
+      <p style="color:#777;font-size:13px">If you did not request this, you can ignore this email.</p>
+    </div>
+  `;
+
+  try {
+    await sendEmail({
+      to: e,
+      subject: 'Reset your R2Finance password',
+      text,
+      html,
+    });
+  } catch (err) {
+    console.error('password reset email failed', err);
+    const e2 = new Error('Could not send reset email — try again later');
+    e2.status = 502;
+    throw e2;
+  }
+
+  return {
+    ok: true,
+    message:
+      'Check your email for a link to reset your password on the R2Finance website.',
+    website: base,
+  };
+}
+
+/**
+ * Complete password reset using the one-time token from email.
+ */
+async function resetPasswordWithToken(token, password) {
+  const t = String(token || '').trim();
+  if (!t || t.length < 32) {
+    const err = new Error('Invalid or expired reset link');
+    err.status = 400;
+    throw err;
+  }
+  if (!password || password.length < 10) {
+    const err = new Error('Password must be at least 10 characters');
+    err.status = 400;
+    throw err;
+  }
+
+  const out = await ddb.ddb.send(
+    new GetCommand({ TableName: tableName, Key: resetKey(t) }),
+  );
+  const row = out.Item;
+  if (!row || row.used || !row.expiresAt || row.expiresAt < Date.now()) {
+    const err = new Error('Invalid or expired reset link');
+    err.status = 400;
+    throw err;
+  }
+
+  const e = normalizeEmail(row.email);
+  if (e !== ALLOWED_EMAIL) {
+    const err = new Error('Invalid or expired reset link');
+    err.status = 400;
+    throw err;
+  }
+
+  const user = await ensureUser(e);
+  const { salt, hash } = hashPassword(password);
+  await putUser({
+    ...user,
+    passwordHash: hash,
+    passwordSalt: salt,
+    mustSetPassword: false,
+    updatedAt: Date.now(),
+  });
+
+  // One-time use
+  await ddb.ddb.send(
+    new DeleteCommand({ TableName: tableName, Key: resetKey(t) }),
+  );
+
+  return {
+    ok: true,
+    email: e,
+    message: 'Password updated. Sign in with your new password.',
+  };
+}
+
 module.exports = {
   ALLOWED_EMAIL,
   ensureUser,
@@ -323,4 +496,6 @@ module.exports = {
   mfaVerify,
   validateSession,
   normalizeEmail,
+  requestPasswordReset,
+  resetPasswordWithToken,
 };
