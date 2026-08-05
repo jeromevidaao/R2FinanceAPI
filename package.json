@@ -1,6 +1,6 @@
 {
   "name": "r2finance-api",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "R2Finance AWS API — Lambda + DynamoDB + YNAB bidirectional sync",
   "main": "src/handlers/apiHandler.js",

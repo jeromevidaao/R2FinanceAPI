@@ -164,6 +164,11 @@ async function authStatus(email) {
   };
 }
 
+/**
+ * First-time password set only (invite / bootstrap). If a password already
+ * exists, callers must use forgot-password + reset-password token — this
+ * endpoint must never overwrite an existing password without a token.
+ */
 async function setPassword(email, password) {
   const e = normalizeEmail(email);
   if (!isAllowedEmail(e)) {
@@ -177,6 +182,13 @@ async function setPassword(email, password) {
     throw err;
   }
   const user = await ensureUser(e);
+  if (user.passwordHash && !user.mustSetPassword) {
+    const err = new Error(
+      'Password already set. Use Forgot password on the sign-in page.',
+    );
+    err.status = 403;
+    throw err;
+  }
   const { salt, hash } = hashPassword(password);
   await putUser({
     ...user,
@@ -189,6 +201,12 @@ async function setPassword(email, password) {
 }
 
 async function createSession(email) {
+  const e = normalizeEmail(email);
+  if (!isAllowedEmail(e)) {
+    const err = new Error('Not allowed');
+    err.status = 403;
+    throw err;
+  }
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000;
   await ddb.ddb.send(
@@ -197,7 +215,7 @@ async function createSession(email) {
       Item: {
         ...sessionKey(token),
         entityType: 'session',
-        email: normalizeEmail(email),
+        email: e,
         expiresAt,
         createdAt: Date.now(),
       },
@@ -206,6 +224,10 @@ async function createSession(email) {
   return { token, expiresAt };
 }
 
+/**
+ * Validate bearer session. Rejects expired tokens and any email not on
+ * the hard allow-list (Jerome + Ngoc only).
+ */
 async function validateSession(token) {
   if (!token) return null;
   const out = await ddb.ddb.send(
@@ -213,7 +235,9 @@ async function validateSession(token) {
   );
   const s = out.Item;
   if (!s || !s.expiresAt || s.expiresAt < Date.now()) return null;
-  return s;
+  const e = normalizeEmail(s.email);
+  if (!isAllowedEmail(e)) return null;
+  return { ...s, email: e };
 }
 
 async function login(email, password) {

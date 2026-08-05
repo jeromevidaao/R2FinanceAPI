@@ -20,16 +20,17 @@ describe('apiHandler health', () => {
 });
 
 describe('categorize API contract', () => {
-  it('rejects missing ids with 400', async () => {
+  it('requires session before body validation', async () => {
     const { handler } = require('../src/handlers/apiHandler');
     const res = await handler({
       rawPath: '/v1/transactions/categorize',
       requestContext: { http: { method: 'POST' } },
       body: JSON.stringify({}),
     });
-    assert.equal(res.statusCode, 400);
+    // Auth gate runs first — unauthenticated never reaches field validation.
+    assert.equal(res.statusCode, 401);
     const body = JSON.parse(res.body);
-    assert.match(body.error, /ynabTxnId|categoryYnabId/);
+    assert.equal(body.error, 'unauthorized');
   });
 });
 
@@ -66,14 +67,14 @@ describe('mapTxn stable client id', () => {
 });
 
 describe('device/push route exists', () => {
-  it('is registered (not 404 for empty body — may 500 without AWS)', async () => {
+  it('requires session (not open, not 404)', async () => {
     const { handler } = require('../src/handlers/apiHandler');
     const res = await handler({
       rawPath: '/v1/device/push',
       requestContext: { http: { method: 'POST' } },
       body: JSON.stringify({ payees: [], transactions: [] }),
     });
-    // Without AWS creds this may 500; must not be not_found.
+    assert.equal(res.statusCode, 401);
     assert.notEqual(res.statusCode, 404);
   });
 });

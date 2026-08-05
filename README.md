@@ -104,7 +104,20 @@ bash scripts/invoke-import.sh   # full YNAB → DDB
 
 API Gateway HTTP + Lambda + DynamoDB on-demand only. 15‑minute schedule stays under YNAB’s **200 req/h** limit for personal use.
 
-## Security
+## Security (household lock)
 
-- PAT only in Secrets Manager — never commit tokens  
-- HTTP API is currently open (personal); add auth before any public use  
+**Only Jerome (`jerome.ans@gmail.com`) and Ngoc (`ngoc.h.dinh@gmail.com`) may use the API.**  
+Hard allow-list in `src/lib/auth.js` (`ALLOWED_EMAILS`). Sessions for any other email are rejected.
+
+| Layer | Rule |
+|-------|------|
+| Default deny | Every route except health + auth login/reset needs `Authorization: Bearer <session>` |
+| Allow-list | `validateSession` / `createSession` / login reject non-household emails |
+| Public auth | `login`, `forgot-password`, `reset-password`, `status`, first-time `set-password`, MFA steps |
+| set-password | First-time only — cannot overwrite an existing password (use reset link) |
+| Invite | Admin session only (`jerome.ans@gmail.com`) and still allow-list bound |
+| CORS | Browser origins: `https://finance.i-liquid.be` (+ local Vite) |
+| Secrets | YNAB PAT in Secrets Manager; Plaid + FCM in SSM — never git |
+| Schedule | EventBridge invokes `R2FinanceYnabPull` Lambda **directly** (not HTTP) |
+
+Website and Android always send the session bearer on ledger/sync calls.

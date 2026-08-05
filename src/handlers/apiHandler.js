@@ -7,15 +7,64 @@ const connectors = require('../lib/connectors');
 const fcm = require('../lib/fcm');
 const { ledgerPlanId } = require('../lib/config');
 
-function json(statusCode, body) {
+/**
+ * Browser origins allowed for CORS. Non-browser clients (Android) send no
+ * Origin header — CORS does not apply to them.
+ */
+const CORS_ORIGINS = new Set([
+  'https://finance.i-liquid.be',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+]);
+
+/**
+ * Public routes (no session). Everything else requires a valid session for
+ * an allow-listed email (Jerome or Ngoc only). Login + password recovery stay
+ * public so household members can authenticate.
+ */
+const PUBLIC_ROUTES = new Set([
+  'GET /',
+  'GET /health',
+  'POST /v1/auth/bootstrap',
+  'POST /v1/auth/status',
+  'POST /v1/auth/set-password',
+  'POST /v1/auth/login',
+  'POST /v1/auth/mfa/setup',
+  'POST /v1/auth/mfa/enable',
+  'POST /v1/auth/mfa/verify',
+  'POST /v1/auth/forgot-password',
+  'POST /v1/auth/reset-password',
+]);
+
+function isPublicRoute(method, path) {
+  return PUBLIC_ROUTES.has(`${method} ${path}`);
+}
+
+function header(event, name) {
+  const h = event?.headers || {};
+  const want = name.toLowerCase();
+  for (const [k, v] of Object.entries(h)) {
+    if (String(k).toLowerCase() === want) return v;
+  }
+  return undefined;
+}
+
+function corsOrigin(event) {
+  const origin = header(event, 'origin');
+  if (!origin) return '*'; // native / curl — not a browser CORS context
+  return CORS_ORIGINS.has(origin) ? origin : 'https://finance.i-liquid.be';
+}
+
+function json(statusCode, body, event = null) {
   return {
     statusCode,
     headers: {
       'content-type': 'application/json',
-      'access-control-allow-origin': '*',
+      'access-control-allow-origin': corsOrigin(event),
       'access-control-allow-headers':
         'authorization,content-type,x-r2finance-client,x-client',
       'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
+      vary: 'Origin',
     },
     body: JSON.stringify(body),
   };
@@ -28,15 +77,6 @@ function parseBody(event) {
   } catch {
     return {};
   }
-}
-
-function header(event, name) {
-  const h = event?.headers || {};
-  const want = name.toLowerCase();
-  for (const [k, v] of Object.entries(h)) {
-    if (String(k).toLowerCase() === want) return v;
-  }
-  return undefined;
 }
 
 function clientIp(event) {
@@ -101,12 +141,21 @@ function bearerToken(event) {
   return hdr.replace(/^Bearer\s+/i, '').trim();
 }
 
+/**
+ * Require a valid session for an allow-listed household member.
+ * validateSession already rejects non-allowlist emails.
+ */
 async function requireSession(event) {
   const token = bearerToken(event);
   const session = await auth.validateSession(token);
   if (!session) {
     const err = new Error('unauthorized');
     err.status = 401;
+    throw err;
+  }
+  if (!auth.isAllowedEmail(session.email)) {
+    const err = new Error('forbidden');
+    err.status = 403;
     throw err;
   }
   return session;
@@ -116,12 +165,19 @@ exports.handler = async (event) => {
   const method =
     event?.requestContext?.http?.method || event?.httpMethod || 'GET';
   const path = event?.rawPath || event?.path || '/';
+  const respond = (code, body) => json(code, body, event);
 
-  if (method === 'OPTIONS') return json(204, {});
+  if (method === 'OPTIONS') return respond(204, {});
 
   try {
+    // ── Default deny: session required unless route is public ─────────
+    let session = null;
+    if (!isPublicRoute(method, path)) {
+      session = await requireSession(event);
+    }
+
     if (method === 'GET' && (path === '/' || path === '/health')) {
-      return json(200, {
+      return respond(200, {
         ok: true,
         service: 'R2FinanceAPI',
         phase: 3,
@@ -130,10 +186,10 @@ exports.handler = async (event) => {
       });
     }
 
-    // ── Auth ──────────────────────────────────────────────────────────
+    // ── Auth (public subset; invite requires admin session) ───────────
     if (method === 'POST' && path === '/v1/auth/bootstrap') {
       const user = await auth.ensureUser(auth.ALLOWED_EMAIL);
-      return json(200, {
+      return respond(200, {
         ok: true,
         email: user.email,
         mustSetPassword: !!user.mustSetPassword || !user.passwordHash,
@@ -143,24 +199,24 @@ exports.handler = async (event) => {
 
     if (method === 'POST' && path === '/v1/auth/status') {
       const body = parseBody(event);
-      return json(200, await auth.authStatus(body.email));
+      return respond(200, await auth.authStatus(body.email));
     }
 
     if (method === 'POST' && path === '/v1/auth/set-password') {
       const body = parseBody(event);
-      return json(200, await auth.setPassword(body.email, body.password));
+      return respond(200, await auth.setPassword(body.email, body.password));
     }
 
     if (method === 'POST' && path === '/v1/auth/login') {
       const body = parseBody(event);
       const result = await auth.login(body.email, body.password);
       await maybeNotifySignIn(event, body, result);
-      return json(200, result);
+      return respond(200, result);
     }
 
     if (method === 'POST' && path === '/v1/auth/mfa/setup') {
       const body = parseBody(event);
-      return json(200, await auth.mfaSetupStart(body.email, body.password));
+      return respond(200, await auth.mfaSetupStart(body.email, body.password));
     }
 
     if (method === 'POST' && path === '/v1/auth/mfa/enable') {
@@ -171,32 +227,31 @@ exports.handler = async (event) => {
         body.code,
       );
       await maybeNotifySignIn(event, body, result);
-      return json(200, result);
+      return respond(200, result);
     }
 
     if (method === 'POST' && path === '/v1/auth/mfa/verify') {
       const body = parseBody(event);
       const result = await auth.mfaVerify(body.mfaToken, body.code);
       await maybeNotifySignIn(event, body, result);
-      return json(200, result);
+      return respond(200, result);
     }
 
     if (method === 'GET' && path === '/v1/auth/me') {
-      const hdr = event?.headers?.authorization || event?.headers?.Authorization || '';
-      const token = hdr.replace(/^Bearer\s+/i, '').trim();
-      const session = await auth.validateSession(token);
-      if (!session) return json(401, { error: 'unauthorized' });
-      return json(200, { email: session.email, expiresAt: session.expiresAt });
+      return respond(200, {
+        email: session.email,
+        expiresAt: session.expiresAt,
+      });
     }
 
     if (method === 'POST' && path === '/v1/auth/forgot-password') {
       const body = parseBody(event);
-      return json(200, await auth.requestPasswordReset(body.email));
+      return respond(200, await auth.requestPasswordReset(body.email));
     }
 
     if (method === 'POST' && path === '/v1/auth/reset-password') {
       const body = parseBody(event);
-      return json(
+      return respond(
         200,
         await auth.resetPasswordWithToken(body.token, body.password),
       );
@@ -204,19 +259,16 @@ exports.handler = async (event) => {
 
     // Admin invite (session must be primary admin email)
     if (method === 'POST' && path === '/v1/auth/invite') {
-      const hdr =
-        event?.headers?.authorization || event?.headers?.Authorization || '';
-      const token = hdr.replace(/^Bearer\s+/i, '').trim();
-      const session = await auth.validateSession(token);
       if (!session || session.email !== auth.ALLOWED_EMAIL) {
-        return json(401, { error: 'admin_required' });
+        return respond(403, { error: 'admin_required' });
       }
       const body = parseBody(event);
-      return json(200, await auth.inviteUser(body.email));
+      return respond(200, await auth.inviteUser(body.email));
     }
 
+    // ── Ledger / sync — session + allow-list only ─────────────────────
     if (method === 'GET' && path === '/v1/stats') {
-      return json(200, await sync.stats());
+      return respond(200, await sync.stats());
     }
 
     if (method === 'POST' && path === '/v1/sync/import') {
@@ -224,33 +276,33 @@ exports.handler = async (event) => {
       const report = await sync.fullImport({
         sinceDate: body.sinceDate || '1990-01-01',
       });
-      return json(200, report);
+      return respond(200, report);
     }
 
     if (method === 'POST' && path === '/v1/sync/pull') {
-      return json(200, await sync.deltaPull());
+      return respond(200, await sync.deltaPull());
     }
 
     if (method === 'POST' && path === '/v1/sync/push') {
-      return json(200, await sync.pushPending(parseBody(event)));
+      return respond(200, await sync.pushPending(parseBody(event)));
     }
 
     if (method === 'POST' && path === '/v1/sync/tick') {
-      // Pull then push — used by schedule or manual
+      // Pull then push — used by client manual refresh (EventBridge hits Lambdas directly)
       const pull = await sync.deltaPull();
       const push = await sync.pushPending();
-      return json(200, { pull, push });
+      return respond(200, { pull, push });
     }
 
     // Phone offline-first: land Room PENDING_PUSH into DDB. YNAB later via tick/schedule.
     if (method === 'POST' && path === '/v1/device/push') {
-      return json(200, await sync.devicePush(parseBody(event)));
+      return respond(200, await sync.devicePush(parseBody(event)));
     }
 
     if (method === 'POST' && path === '/v1/transactions/categorize') {
       const body = parseBody(event);
       if (!body.ynabTxnId || !body.categoryYnabId) {
-        return json(400, {
+        return respond(400, {
           error: 'ynabTxnId and categoryYnabId required',
         });
       }
@@ -260,29 +312,29 @@ exports.handler = async (event) => {
       if (body.push !== false) {
         push = await sync.pushPending({ limit: 5 });
       }
-      return json(200, { marked, push });
+      return respond(200, { marked, push });
     }
 
     if (method === 'POST' && path === '/v1/transactions/approve') {
       const body = parseBody(event);
       if (!body.ynabTxnId) {
-        return json(400, { error: 'ynabTxnId required' });
+        return respond(400, { error: 'ynabTxnId required' });
       }
       const marked = await sync.approveTransaction(body);
       let push;
       if (body.push !== false) {
         push = await sync.pushPending({ limit: 5 });
       }
-      return json(200, { marked, push });
+      return respond(200, { marked, push });
     }
 
     if (method === 'GET' && path === '/v1/inbox') {
-      return json(200, await sync.listInbox());
+      return respond(200, await sync.listInbox());
     }
 
     if (method === 'GET' && path === '/v1/accounts') {
       const items = await ddb.queryPk(ddb.planPk(), 'ACCT#');
-      return json(200, {
+      return respond(200, {
         accounts: items
           .filter((i) => !i.deleted && !i.closed)
           .map((i) => ({
@@ -301,7 +353,7 @@ exports.handler = async (event) => {
     if (method === 'GET' && path === '/v1/categories') {
       const groups = await ddb.queryPk(ddb.planPk(), 'CGRP#');
       const cats = await ddb.queryPk(ddb.planPk(), 'CAT#');
-      return json(200, {
+      return respond(200, {
         groups: groups
           .filter((g) => !g.deleted)
           .map((g) => ({
@@ -322,7 +374,7 @@ exports.handler = async (event) => {
 
     if (method === 'GET' && path === '/v1/payees') {
       const items = await ddb.queryPk(ddb.planPk(), 'PAYEE#');
-      return json(200, {
+      return respond(200, {
         payees: items
           .filter((p) => !p.deleted)
           .map((p) => ({
@@ -336,7 +388,7 @@ exports.handler = async (event) => {
     if (method === 'GET' && path === '/v1/transactions') {
       const items = await ddb.queryPk(ddb.planPk(), 'TXN#');
       // Map closed accounts if needed — return all non-deleted for hydrate
-      return json(200, {
+      return respond(200, {
         transactions: items
           .filter((t) => !t.deleted)
           .map((t) => sync.mapTxn(t)),
@@ -345,7 +397,7 @@ exports.handler = async (event) => {
 
     if (method === 'GET' && path === '/v1/plan') {
       const meta = await ddb.getItem(ddb.planPk(), 'META');
-      return json(200, {
+      return respond(200, {
         plan: {
           name: meta?.payload?.name || meta?.name || 'Plan',
           ynabPlanId: meta?.ynabPlanId || meta?.payload?.ynabPlanId,
@@ -360,12 +412,11 @@ exports.handler = async (event) => {
     // Supported banks: boa, chase, vanguard, venmo (see connectors.BANKS).
     // Each household member has their own set (2× each bank type).
     if (method === 'GET' && path === '/v1/connectors') {
-      const session = await requireSession(event);
       const qs = event?.queryStringParameters || {};
       if (qs.household === '1' || qs.household === 'true') {
-        return json(200, await connectors.listHousehold({ email: session.email }));
+        return respond(200, await connectors.listHousehold({ email: session.email }));
       }
-      return json(200, await connectors.listStatus({ email: session.email }));
+      return respond(200, await connectors.listStatus({ email: session.email }));
     }
 
     const connectorMatch = path.match(
@@ -376,20 +427,18 @@ exports.handler = async (event) => {
       const action = connectorMatch[2] || null;
 
       if (method === 'GET' && !action) {
-        const session = await requireSession(event);
-        return json(
+        return respond(
           200,
           await connectors.status(bankId, { email: session.email }),
         );
       }
 
       if (method === 'POST' && action === 'link-token') {
-        const session = await requireSession(event);
         const bank = connectors.resolveBank(bankId);
         const out = await connectors.createLinkToken(bankId, {
           email: session.email,
         });
-        return json(200, {
+        return respond(200, {
           link_token: out.link_token,
           expiration: out.expiration,
           request_id: out.request_id,
@@ -400,40 +449,47 @@ exports.handler = async (event) => {
       }
 
       if (method === 'POST' && action === 'exchange') {
-        const session = await requireSession(event);
         const body = parseBody(event);
         const result = await connectors.exchangeAndStore(bankId, {
           publicToken: body.public_token || body.publicToken,
           email: session.email,
           metadata: body.metadata || null,
         });
-        return json(200, result);
+        return respond(200, result);
       }
 
       if (method === 'GET' && action === 'accounts') {
-        const session = await requireSession(event);
-        return json(
+        return respond(
           200,
           await connectors.probeAccounts(bankId, { email: session.email }),
         );
       }
 
       if (method === 'POST' && action === 'disconnect') {
-        const session = await requireSession(event);
-        return json(
+        return respond(
           200,
           await connectors.disconnect(bankId, { email: session.email }),
         );
       }
     }
 
-    return json(404, { error: 'not_found', path, method });
+    return respond(404, { error: 'not_found', path, method });
   } catch (e) {
-    console.error(e);
     const status = e.status && Number.isInteger(e.status) ? e.status : 500;
-    return json(status, {
+    // Expected auth failures stay quiet; real faults are logged.
+    if (status >= 500) {
+      console.error(e);
+    } else if (status !== 401 && status !== 403) {
+      console.warn(e.message || e);
+    }
+    return respond(status, {
       error: e.message || String(e),
       code: e.code || undefined,
     });
   }
 };
+
+// Exported for unit tests
+exports.isPublicRoute = isPublicRoute;
+exports.PUBLIC_ROUTES = PUBLIC_ROUTES;
+exports.CORS_ORIGINS = CORS_ORIGINS;
