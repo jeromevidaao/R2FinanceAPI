@@ -1,0 +1,14 @@
+{
+  "name": "r2finance-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "R2Finance AWS Lambda + DynamoDB API (low cost)",
+  "main": "src/handlers/apiHandler.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "lint": "node -c src/handlers/apiHandler.js && node -c src/handlers/ynabPull.js && node -c src/handlers/ynabPush.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
