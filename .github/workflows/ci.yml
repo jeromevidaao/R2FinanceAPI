@@ -14,7 +14,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Syntax + unit tests
+      - name: Install + lint + unit tests
         run: |
+          npm ci
           npm run lint
           npm test
