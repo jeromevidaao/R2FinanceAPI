@@ -16,4 +16,11 @@ module.exports = {
   resetFromEmail: process.env.R2FINANCE_RESET_FROM || 'no-reply@i-liquid.be',
   /** Password-reset token lifetime (ms). */
   resetTokenTtlMs: Number(process.env.R2FINANCE_RESET_TTL_MS || 60 * 60 * 1000),
+  /** Plaid API credentials secret (JSON: client_id, secret, env). */
+  plaidSecretId: process.env.PLAID_SECRET_ID || 'R2Finance/plaid',
+  /** Plaid env fallback if secret omits env. */
+  plaidEnv: process.env.PLAID_ENV || 'sandbox',
+  /** Connected Bank of America item access_token secret. */
+  boaItemSecretId:
+    process.env.BOA_ITEM_SECRET_ID || 'R2Finance/connectors/boa',
 };

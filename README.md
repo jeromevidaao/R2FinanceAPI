@@ -50,8 +50,34 @@ Phone (Room)  ──POST /v1/device/push──►  DynamoDB  ──pushPending /
 | POST | `/v1/auth/forgot-password` | Email one-time reset link → finance.i-liquid.be |
 | POST | `/v1/auth/reset-password` | Set new password with token from email |
 | POST | `/v1/auth/invite` | Admin session only — create user + email set-password (CC admin) |
+| GET | `/v1/connectors/boa` | Bank of America (Plaid) connection status (session required) |
+| POST | `/v1/connectors/boa/link-token` | Create Plaid Link token for BoA |
+| POST | `/v1/connectors/boa/exchange` | Exchange public_token → store access (Secrets Manager) |
+| GET | `/v1/connectors/boa/accounts` | Live probe of BoA accounts/balances (not DDB ledger) |
+| POST | `/v1/connectors/boa/disconnect` | Remove Plaid item + clear stored token |
 
 Password / invite mail is sent from **`no-reply@i-liquid.be`** (SES + DKIM on `i-liquid.be`).
+
+### Bank of America connector (Plaid)
+
+Establishes read access to BoA (credit cards / deposits) via [Plaid Link](https://plaid.com).  
+**Does not** write bank transactions into DynamoDB ledger `TXN#` rows yet.
+
+1. Create a Plaid account → Dashboard API keys.
+2. Register redirect URI `https://finance.i-liquid.be/connectors` for OAuth (BoA).
+3. Put credentials in Secrets Manager:
+
+```bash
+aws secretsmanager create-secret --name R2Finance/plaid --secret-string '{
+  "client_id": "…",
+  "secret": "…",
+  "env": "sandbox"
+}' --region us-east-1
+# env: sandbox | development | production
+```
+
+4. On the website: **Connectors → Connect Bank of America**.
+5. Connected item token is stored at `R2Finance/connectors/boa` (not in the browser).
 
 ## Deploy
 

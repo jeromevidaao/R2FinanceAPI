@@ -3,6 +3,7 @@
 const sync = require('../lib/sync');
 const ddb = require('../lib/ddb');
 const auth = require('../lib/auth');
+const connectors = require('../lib/connectors');
 const { ledgerPlanId } = require('../lib/config');
 
 function json(statusCode, body) {
@@ -25,6 +26,23 @@ function parseBody(event) {
   } catch {
     return {};
   }
+}
+
+function bearerToken(event) {
+  const hdr =
+    event?.headers?.authorization || event?.headers?.Authorization || '';
+  return hdr.replace(/^Bearer\s+/i, '').trim();
+}
+
+async function requireSession(event) {
+  const token = bearerToken(event);
+  const session = await auth.validateSession(token);
+  if (!session) {
+    const err = new Error('unauthorized');
+    err.status = 401;
+    throw err;
+  }
+  return session;
 }
 
 exports.handler = async (event) => {
@@ -263,10 +281,52 @@ exports.handler = async (event) => {
       });
     }
 
+    // ── Bank connectors (Plaid / Bank of America) ─────────────────────
+    // Access only — never write bank transactions into DDB ledger TXN#.
+    if (method === 'GET' && path === '/v1/connectors/boa') {
+      await requireSession(event);
+      return json(200, await connectors.status());
+    }
+
+    if (method === 'POST' && path === '/v1/connectors/boa/link-token') {
+      const session = await requireSession(event);
+      const out = await connectors.createLinkToken({ email: session.email });
+      return json(200, {
+        link_token: out.link_token,
+        expiration: out.expiration,
+        request_id: out.request_id,
+        institution: 'Bank of America',
+      });
+    }
+
+    if (method === 'POST' && path === '/v1/connectors/boa/exchange') {
+      const session = await requireSession(event);
+      const body = parseBody(event);
+      const result = await connectors.exchangeAndStore({
+        publicToken: body.public_token || body.publicToken,
+        email: session.email,
+        metadata: body.metadata || null,
+      });
+      return json(200, result);
+    }
+
+    if (method === 'GET' && path === '/v1/connectors/boa/accounts') {
+      await requireSession(event);
+      return json(200, await connectors.probeAccounts());
+    }
+
+    if (method === 'POST' && path === '/v1/connectors/boa/disconnect') {
+      await requireSession(event);
+      return json(200, await connectors.disconnect());
+    }
+
     return json(404, { error: 'not_found', path, method });
   } catch (e) {
     console.error(e);
     const status = e.status && Number.isInteger(e.status) ? e.status : 500;
-    return json(status, { error: e.message || String(e) });
+    return json(status, {
+      error: e.message || String(e),
+      code: e.code || undefined,
+    });
   }
 };
