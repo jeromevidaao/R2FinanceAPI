@@ -10,13 +10,25 @@ const {
 } = require('./config');
 const { sendEmail } = require('./email');
 
-const ALLOWED_EMAIL = 'jerome.ans@gmail.com';
+/** Invited accounts (private household ledger). */
+const ALLOWED_EMAILS = [
+  'jerome.ans@gmail.com',
+  'ngoc.h.dinh@gmail.com',
+];
+/** Primary admin (bootstrap / CC on invites). */
+const ALLOWED_EMAIL = ALLOWED_EMAILS[0];
 /** Long-lived so OTA updates never force password+MFA for months. */
 const SESSION_DAYS = 180;
 const RESET_COOLDOWN_MS = 60 * 1000;
+/** Invite / first-set-password links last longer than reset. */
+const INVITE_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase();
+}
+
+function isAllowedEmail(email) {
+  return ALLOWED_EMAILS.includes(normalizeEmail(email));
 }
 
 function userKey(email) {
@@ -109,12 +121,12 @@ async function putUser(item) {
 }
 
 /**
- * Ensure the allowed user exists (must set password on first login).
+ * Ensure an allowed user exists (must set password on first login).
  */
 async function ensureUser(email = ALLOWED_EMAIL) {
   const e = normalizeEmail(email);
-  if (e !== ALLOWED_EMAIL) {
-    const err = new Error('This app is private; only the invited user may sign in.');
+  if (!isAllowedEmail(e)) {
+    const err = new Error('This app is private; only invited users may sign in.');
     err.status = 403;
     throw err;
   }
@@ -139,7 +151,7 @@ async function ensureUser(email = ALLOWED_EMAIL) {
 
 async function authStatus(email) {
   const e = normalizeEmail(email);
-  if (e !== ALLOWED_EMAIL) {
+  if (!isAllowedEmail(e)) {
     return { allowed: false, exists: false };
   }
   const user = await ensureUser(e);
@@ -154,7 +166,7 @@ async function authStatus(email) {
 
 async function setPassword(email, password) {
   const e = normalizeEmail(email);
-  if (e !== ALLOWED_EMAIL) {
+  if (!isAllowedEmail(e)) {
     const err = new Error('Not allowed');
     err.status = 403;
     throw err;
@@ -206,7 +218,7 @@ async function validateSession(token) {
 
 async function login(email, password) {
   const e = normalizeEmail(email);
-  if (e !== ALLOWED_EMAIL) {
+  if (!isAllowedEmail(e)) {
     const err = new Error('Invalid email or password');
     err.status = 401;
     throw err;
@@ -220,8 +232,10 @@ async function login(email, password) {
     err.status = 401;
     throw err;
   }
+  // MFA optional: if not enabled, issue session (user can enable later).
   if (!user.mfaEnabled) {
-    return { ok: false, next: 'mfa_setup', email: e, passwordOk: true };
+    const session = await createSession(e);
+    return { ok: true, ...session, email: e };
   }
   // Issue short-lived pending token for MFA step (reuse session table with flag)
   const pending = crypto.randomBytes(24).toString('hex');
@@ -330,7 +344,7 @@ function resetKey(token) {
  */
 async function requestPasswordReset(email) {
   const e = normalizeEmail(email);
-  if (e !== ALLOWED_EMAIL) {
+  if (!isAllowedEmail(e)) {
     // Generic response — do not reveal allow-list membership in detail
     return {
       ok: true,
@@ -457,7 +471,7 @@ async function resetPasswordWithToken(token, password) {
   }
 
   const e = normalizeEmail(row.email);
-  if (e !== ALLOWED_EMAIL) {
+  if (!isAllowedEmail(e)) {
     const err = new Error('Invalid or expired reset link');
     err.status = 400;
     throw err;
@@ -485,8 +499,123 @@ async function resetPasswordWithToken(token, password) {
   };
 }
 
+/**
+ * Create (or refresh) an invited user and email a set-password link.
+ * Always CCs the admin (Jerome).
+ */
+async function inviteUser(email, { ccAdmin = true } = {}) {
+  const e = normalizeEmail(email);
+  if (!isAllowedEmail(e)) {
+    const err = new Error(
+      `Email ${e} is not on the R2Finance allow-list. Add it in auth.js first.`,
+    );
+    err.status = 403;
+    throw err;
+  }
+
+  const user = await ensureUser(e);
+  const now = Date.now();
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = now + INVITE_TOKEN_TTL_MS;
+
+  await ddb.ddb.send(
+    new PutCommand({
+      TableName: tableName,
+      Item: {
+        ...resetKey(token),
+        entityType: 'password_reset',
+        purpose: 'invite',
+        email: e,
+        expiresAt,
+        createdAt: now,
+        used: false,
+      },
+    }),
+  );
+
+  await putUser({
+    ...user,
+    mustSetPassword: !user.passwordHash,
+    invitedAt: user.invitedAt || now,
+    lastInviteEmailAt: now,
+    updatedAt: now,
+  });
+
+  const base = String(websiteBaseUrl || 'https://finance.i-liquid.be').replace(
+    /\/$/,
+    '',
+  );
+  const link = `${base}/reset-password?token=${encodeURIComponent(token)}`;
+  const site = base;
+  const days = Math.max(1, Math.round(INVITE_TOKEN_TTL_MS / (24 * 60 * 60 * 1000)));
+
+  const text = [
+    'You are invited to R2Finance',
+    '',
+    'Jerome shared the R2Finance household ledger with you.',
+    '',
+    `Website: ${site}`,
+    '',
+    'Please open this link to choose your password (one-time, expires in ' +
+      `${days} days):`,
+    '',
+    link,
+    '',
+    'After you set a password, sign in at the same website with your email.',
+    'You can also use the R2Finance Android app with the same account.',
+    '',
+    '— R2Finance',
+  ].join('\n');
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.5;color:#111">
+      <h2 style="margin:0 0 12px">You’re invited to R2Finance</h2>
+      <p>Jerome shared the <strong>R2Finance</strong> household ledger with you.</p>
+      <p>
+        <a href="${link}" style="display:inline-block;background:#2a9f6f;color:#fff;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:600">
+          Set your password
+        </a>
+      </p>
+      <p style="color:#555;font-size:14px">
+        Website: <a href="${site}">${site}</a><br/>
+        This set-password link expires in ${days} days.
+      </p>
+      <p style="color:#555;font-size:13px;word-break:break-all">${link}</p>
+      <p style="color:#777;font-size:13px">
+        After setting a password, sign in with <strong>${e}</strong> on the website
+        (or the R2Finance Android app).
+      </p>
+    </div>
+  `;
+
+  try {
+    await sendEmail({
+      to: e,
+      cc: ccAdmin ? [ALLOWED_EMAIL] : [],
+      subject: 'You’re invited to R2Finance — set your password',
+      text,
+      html,
+    });
+  } catch (err) {
+    console.error('invite email failed', err);
+    const e2 = new Error('Could not send invite email — try again later');
+    e2.status = 502;
+    throw e2;
+  }
+
+  return {
+    ok: true,
+    email: e,
+    website: site,
+    expiresAt,
+    message: `Invite sent to ${e}${ccAdmin ? ` (CC ${ALLOWED_EMAIL})` : ''}`,
+  };
+}
+
 module.exports = {
   ALLOWED_EMAIL,
+  ALLOWED_EMAILS,
+  isAllowedEmail,
   ensureUser,
   authStatus,
   setPassword,
@@ -498,4 +627,5 @@ module.exports = {
   normalizeEmail,
   requestPasswordReset,
   resetPasswordWithToken,
+  inviteUser,
 };

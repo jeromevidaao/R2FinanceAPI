@@ -458,27 +458,85 @@ async function pushPending({ limit = 40 } = {}) {
       continue;
     }
 
-    const ynabTxnId = item.ynabId || item.sk.replace(/^TXN#/, '');
     const payload = item.payload || {};
     const categoryId = item.categoryId !== undefined ? item.categoryId : payload.category_id;
     const approved = item.approved !== undefined ? item.approved : payload.approved;
     const memo = item.memo !== undefined ? item.memo : payload.memo;
     const cleared = item.cleared || payload.cleared;
+    const accountId = item.accountId || payload.account_id;
+    const date = item.date || payload.date;
+    const amount = item.amount ?? payload.amount;
+    const payeeId = item.payeeId ?? payload.payee_id ?? null;
+    const payeeName = payload.payee_name || null;
+    const needsCreate = item.deviceCreate || !item.ynabId;
 
     try {
+      if (needsCreate) {
+        // Device-originated txn not yet in YNAB.
+        const created = await ynab.createTransaction(ynabPlanId, {
+          account_id: accountId,
+          date,
+          amount,
+          payee_id: payeeId,
+          payee_name: !payeeId && payeeName ? payeeName : undefined,
+          category_id: categoryId,
+          memo: memo ?? null,
+          cleared: cleared || 'uncleared',
+          approved: approved !== false,
+          import_id: payload.import_id || item.clientId || undefined,
+        });
+        const newYnabId = created.id || created.transaction?.id;
+        await ddb.putItem({
+          ...item,
+          ynabId: newYnabId,
+          deviceCreate: false,
+          syncStatus: 'SYNCED',
+          updatedAt: Date.now(),
+          payload: {
+            ...payload,
+            id: newYnabId,
+          },
+          gsi2pk: undefined,
+          gsi2sk: undefined,
+        });
+        // Clear GSI pending keys
+        await ddb.markSynced(item.pk, item.sk, { ynabId: newYnabId, deviceCreate: false });
+        results.push({ sk: item.sk, ok: true, created: true, ynabTxnId: newYnabId });
+        continue;
+      }
+
+      const ynabTxnId = item.ynabId || item.sk.replace(/^TXN#/, '');
       await ynab.updateTransaction(ynabPlanId, ynabTxnId, {
         category_id: categoryId,
         approved: approved !== false,
         memo: memo ?? null,
         cleared: cleared || 'uncleared',
-        // required fields for PUT — pass through from last known
-        account_id: item.accountId || payload.account_id,
-        date: item.date || payload.date,
-        amount: item.amount ?? payload.amount,
-        payee_id: item.payeeId ?? payload.payee_id ?? null,
+        account_id: accountId,
+        date,
+        amount,
+        payee_id: payeeId,
       });
       await ddb.markSynced(item.pk, item.sk);
       results.push({ sk: item.sk, ok: true, ynabTxnId });
+    } catch (e) {
+      results.push({ sk: item.sk, ok: false, error: e.message, status: e.status });
+    }
+  }
+
+  // Pending payees (device-created names) — create in YNAB when possible
+  for (const item of pending) {
+    if (item.entityType !== 'payee' && !String(item.sk || '').startsWith('PAYEE#')) continue;
+    if (!item.deviceCreate && item.ynabId) continue;
+    if (item.syncStatus !== 'PENDING_PUSH' && item.gsi2pk !== 'PENDING_PUSH') continue;
+    try {
+      const name = item.name || item.payload?.name;
+      if (!name) continue;
+      const created = await ynab.createPayee(ynabPlanId, name);
+      await ddb.markSynced(item.pk, item.sk, {
+        ynabId: created.id,
+        deviceCreate: false,
+      });
+      results.push({ sk: item.sk, ok: true, created: true, payeeId: created.id });
     } catch (e) {
       results.push({ sk: item.sk, ok: false, error: e.message, status: e.status });
     }
@@ -545,11 +603,19 @@ async function approveTransaction({ ynabTxnId }) {
 
 /**
  * Map a DDB transaction row to the public API shape.
+ * `id` is the stable client key (device clientId or YNAB id) — never changes after create.
+ * `ynabId` is the real YNAB id once known (null for device-only until push).
  */
 function mapTxn(t) {
   const p = t.payload || {};
+  const skId = String(t.sk || '').replace(/^TXN#/, '') || null;
+  const clientId = t.clientId || p.client_id || null;
+  const ynabId = t.ynabId || p.id || null;
+  const stableId = clientId || ynabId || skId;
   return {
-    ynabId: t.ynabId,
+    id: stableId,
+    clientId,
+    ynabId: ynabId || stableId,
     accountId: t.accountId || p.account_id,
     date: t.date || p.date,
     amount: t.amount ?? p.amount,
@@ -561,7 +627,7 @@ function mapTxn(t) {
     flagColor: p.flag_color || null,
     transferAccountId: p.transfer_account_id || null,
     transferTransactionId: p.transfer_transaction_id || null,
-    importId: p.import_id || null,
+    importId: p.import_id || clientId || null,
     subtransactions: (p.subtransactions || []).map((s) => ({
       ynabId: s.id,
       amount: s.amount,
@@ -569,6 +635,150 @@ function mapTxn(t) {
       categoryId: s.category_id || null,
       memo: s.memo || null,
     })),
+  };
+}
+
+/**
+ * Phone → DDB write path (offline-first).
+ * Lands local PENDING_PUSH rows into DynamoDB; YNAB push happens later via
+ * pushPending / EventBridge — not required for this call to succeed.
+ *
+ * Body:
+ * {
+ *   payees: [{ clientId, name, ynabId? }],
+ *   transactions: [{ clientId, ynabId?, accountId, date, amount, payeeId?,
+ *                    categoryId?, memo?, cleared?, approved?, deleted?,
+ *                    payeeName?, updatedAt? }]
+ * }
+ */
+async function devicePush(body = {}) {
+  const planId = ledgerPlanId;
+  const now = Date.now();
+  const payeesIn = Array.isArray(body.payees) ? body.payees : [];
+  const txnsIn = Array.isArray(body.transactions) ? body.transactions : [];
+  const results = { payees: [], transactions: [] };
+
+  for (const p of payeesIn) {
+    const clientId = p.clientId || p.id || uuid();
+    const ynabId = p.ynabId || null;
+    const name = (p.name || '').trim();
+    if (!name) {
+      results.payees.push({ clientId, ok: false, error: 'name required' });
+      continue;
+    }
+    const sk = ynabId ? `PAYEE#${ynabId}` : `PAYEE#${clientId}`;
+    const existing = await ddb.getItem(ddb.planPk(planId), sk);
+    const item = {
+      pk: ddb.planPk(planId),
+      sk,
+      entityType: 'payee',
+      clientId,
+      ynabId: ynabId || existing?.ynabId || undefined,
+      name,
+      payload: {
+        ...(existing?.payload || {}),
+        id: ynabId || existing?.ynabId || clientId,
+        name,
+        client_id: clientId,
+      },
+      syncStatus: ynabId ? 'SYNCED' : 'PENDING_PUSH',
+      updatedAt: p.updatedAt || now,
+      deleted: !!p.deleted,
+    };
+    if (!ynabId && !item.ynabId) {
+      item.gsi2pk = 'PENDING_PUSH';
+      item.gsi2sk = `${String(item.updatedAt).padStart(15, '0')}#${sk}`;
+      item.deviceCreate = true;
+    }
+    await ddb.putItem(item);
+    results.payees.push({ clientId, ok: true, sk, ynabId: item.ynabId || null });
+  }
+
+  for (const t of txnsIn) {
+    const clientId = t.clientId || t.id || uuid();
+    const ynabId = t.ynabId && t.ynabId !== clientId ? t.ynabId : null;
+    const accountId = t.accountId;
+    if (!accountId || !t.date || t.amount == null) {
+      results.transactions.push({
+        clientId,
+        ok: false,
+        error: 'accountId, date, amount required',
+      });
+      continue;
+    }
+    // Prefer existing YNAB row; else stable client key so offline create survives.
+    const sk = ynabId ? `TXN#${ynabId}` : `TXN#${clientId}`;
+    const existing = await ddb.getItem(ddb.planPk(planId), sk);
+    // Also try lookup by ynabId when client sent both
+    let base = existing;
+    if (!base && ynabId) {
+      base = await ddb.getItem(ddb.planPk(planId), `TXN#${ynabId}`);
+    }
+    if (!base && clientId) {
+      base = await ddb.getItem(ddb.planPk(planId), `TXN#${clientId}`);
+    }
+
+    const isCreate = !base?.ynabId && !ynabId;
+    const payload = {
+      ...(base?.payload || {}),
+      id: ynabId || base?.ynabId || clientId,
+      account_id: accountId,
+      date: t.date,
+      amount: t.amount,
+      payee_id: t.payeeId ?? base?.payeeId ?? null,
+      category_id: t.categoryId ?? base?.categoryId ?? null,
+      memo: t.memo ?? base?.memo ?? null,
+      cleared: t.cleared || base?.cleared || 'uncleared',
+      approved: t.approved !== false,
+      deleted: !!t.deleted,
+      client_id: clientId,
+      import_id: t.importId || clientId,
+      payee_name: t.payeeName || undefined,
+    };
+    const updatedAt = t.updatedAt || now;
+    const item = {
+      pk: ddb.planPk(planId),
+      sk: base?.sk || sk,
+      entityType: 'transaction',
+      clientId,
+      ynabId: ynabId || base?.ynabId || undefined,
+      accountId,
+      date: t.date,
+      amount: t.amount,
+      payeeId: payload.payee_id,
+      categoryId: payload.category_id,
+      memo: payload.memo,
+      cleared: payload.cleared,
+      approved: payload.approved,
+      deleted: payload.deleted,
+      payload,
+      syncStatus: 'PENDING_PUSH',
+      updatedAt,
+      gsi2pk: 'PENDING_PUSH',
+      gsi2sk: `${String(updatedAt).padStart(15, '0')}#${base?.sk || sk}`,
+      deviceCreate: isCreate || !!base?.deviceCreate,
+    };
+    await ddb.putItem(item);
+    results.transactions.push({
+      clientId,
+      ok: true,
+      sk: item.sk,
+      ynabId: item.ynabId || null,
+      deviceCreate: !!item.deviceCreate,
+    });
+  }
+
+  return {
+    ok: true,
+    accepted: {
+      payees: results.payees.filter((r) => r.ok).length,
+      transactions: results.transactions.filter((r) => r.ok).length,
+    },
+    failed: {
+      payees: results.payees.filter((r) => !r.ok).length,
+      transactions: results.transactions.filter((r) => !r.ok).length,
+    },
+    results,
   };
 }
 
@@ -691,6 +901,7 @@ module.exports = {
   fullImport,
   deltaPull,
   pushPending,
+  devicePush,
   categorizeTransaction,
   approveTransaction,
   listInbox,

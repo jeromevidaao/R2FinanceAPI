@@ -110,6 +110,19 @@ exports.handler = async (event) => {
       );
     }
 
+    // Admin invite (session must be primary admin email)
+    if (method === 'POST' && path === '/v1/auth/invite') {
+      const hdr =
+        event?.headers?.authorization || event?.headers?.Authorization || '';
+      const token = hdr.replace(/^Bearer\s+/i, '').trim();
+      const session = await auth.validateSession(token);
+      if (!session || session.email !== auth.ALLOWED_EMAIL) {
+        return json(401, { error: 'admin_required' });
+      }
+      const body = parseBody(event);
+      return json(200, await auth.inviteUser(body.email));
+    }
+
     if (method === 'GET' && path === '/v1/stats') {
       return json(200, await sync.stats());
     }
@@ -135,6 +148,11 @@ exports.handler = async (event) => {
       const pull = await sync.deltaPull();
       const push = await sync.pushPending();
       return json(200, { pull, push });
+    }
+
+    // Phone offline-first: land Room PENDING_PUSH into DDB. YNAB later via tick/schedule.
+    if (method === 'POST' && path === '/v1/device/push') {
+      return json(200, await sync.devicePush(parseBody(event)));
     }
 
     if (method === 'POST' && path === '/v1/transactions/categorize') {

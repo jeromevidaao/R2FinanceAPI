@@ -94,6 +94,23 @@ async function updateTransaction(planId, transactionId, patch) {
   return r.data.transaction || r.data;
 }
 
+/** Create a new transaction in YNAB (device-originated offline creates). */
+async function createTransaction(planId, transaction) {
+  const r = await ynabFetch(`/plans/${planId}/transactions`, {
+    method: 'POST',
+    body: { transaction },
+  });
+  return r.data.transaction || r.data;
+}
+
+async function createPayee(planId, name) {
+  const r = await ynabFetch(`/plans/${planId}/payees`, {
+    method: 'POST',
+    body: { payee: { name } },
+  });
+  return r.data.payee;
+}
+
 async function createCategory(planId, { name, category_group_id }) {
   const r = await ynabFetch(`/plans/${planId}/categories`, {
     method: 'POST',
@@ -119,6 +136,8 @@ module.exports = {
   listTransactions,
   listScheduled,
   updateTransaction,
+  createTransaction,
+  createPayee,
   createCategory,
   updateCategory,
 };

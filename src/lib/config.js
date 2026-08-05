@@ -13,7 +13,7 @@ module.exports = {
   websiteBaseUrl:
     process.env.R2FINANCE_WEBSITE_URL || 'https://finance.i-liquid.be',
   /** Verified SES identity (From). */
-  resetFromEmail: process.env.R2FINANCE_RESET_FROM || 'jerome.ans@gmail.com',
+  resetFromEmail: process.env.R2FINANCE_RESET_FROM || 'no-reply@i-liquid.be',
   /** Password-reset token lifetime (ms). */
   resetTokenTtlMs: Number(process.env.R2FINANCE_RESET_TTL_MS || 60 * 60 * 1000),
 };

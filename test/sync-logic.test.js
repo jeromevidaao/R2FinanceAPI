@@ -32,3 +32,48 @@ describe('categorize API contract', () => {
     assert.match(body.error, /ynabTxnId|categoryYnabId/);
   });
 });
+
+describe('mapTxn stable client id', () => {
+  it('prefers clientId as stable id for device-created rows', () => {
+    const { mapTxn } = require('../src/lib/sync');
+    const mapped = mapTxn({
+      sk: 'TXN#phone-uuid-1',
+      clientId: 'phone-uuid-1',
+      ynabId: 'ynab-real-9',
+      accountId: 'acct-1',
+      date: '2026-08-04',
+      amount: -1000,
+      payload: { client_id: 'phone-uuid-1', account_id: 'acct-1' },
+    });
+    assert.equal(mapped.id, 'phone-uuid-1');
+    assert.equal(mapped.clientId, 'phone-uuid-1');
+    assert.equal(mapped.ynabId, 'ynab-real-9');
+  });
+
+  it('falls back to ynabId when no clientId', () => {
+    const { mapTxn } = require('../src/lib/sync');
+    const mapped = mapTxn({
+      sk: 'TXN#ynab-1',
+      ynabId: 'ynab-1',
+      accountId: 'a',
+      date: '2026-01-01',
+      amount: 0,
+      payload: {},
+    });
+    assert.equal(mapped.id, 'ynab-1');
+    assert.equal(mapped.ynabId, 'ynab-1');
+  });
+});
+
+describe('device/push route exists', () => {
+  it('is registered (not 404 for empty body — may 500 without AWS)', async () => {
+    const { handler } = require('../src/handlers/apiHandler');
+    const res = await handler({
+      rawPath: '/v1/device/push',
+      requestContext: { http: { method: 'POST' } },
+      body: JSON.stringify({ payees: [], transactions: [] }),
+    });
+    // Without AWS creds this may 500; must not be not_found.
+    assert.notEqual(res.statusCode, 404);
+  });
+});

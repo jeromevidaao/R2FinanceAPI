@@ -17,12 +17,19 @@ AWS backend for **R2Finance** — DynamoDB ledger + YNAB bidirectional sync.
 
 ## Sync model
 
+```
+Phone (Room)  ──POST /v1/device/push──►  DynamoDB  ──pushPending / 15m──►  YNAB
+     ▲                                      │
+     └──────── GET /v1/* hydrate ───────────┘
+```
+
 1. **Full import** (`R2FinanceFullImport` or `POST /v1/sync/import`) — all accounts, categories, payees, transactions, scheduled → DDB  
 2. **Delta pull** (`R2FinanceYnabPull` / `POST /v1/sync/pull`) — YNAB `last_knowledge_of_server` → upsert DDB  
    - **Does not overwrite** rows with `syncStatus=PENDING_PUSH` (preserves local categorize until push)  
-3. **Push** (`R2FinanceYnabPush` / `POST /v1/sync/push`) — items with `syncStatus=PENDING_PUSH` (e.g. categorize) → YNAB API  
-4. **Categorize API** — `POST /v1/transactions/categorize` with `{ ynabTxnId, categoryYnabId }` marks pending + optional immediate push  
-5. **Bidirectional** — set category in R2Finance → YNAB; set category in YNAB → appears in DDB on next pull (≤15 min) → Android/web hydrate
+3. **Device push** (`POST /v1/device/push`) — Android offline queue (new txns, categorize, approve) → DDB `PENDING_PUSH`  
+4. **Push to YNAB** (`R2FinanceYnabPush` / `POST /v1/sync/push`) — DDB `PENDING_PUSH` → YNAB create/update  
+5. **Categorize/approve API** — still available; Android prefers device push after local Room write  
+6. **Bidirectional** — phone offline for hours is fine; reconnect → DDB; YNAB ≤15 min later
 
 ## Endpoints
 
@@ -35,12 +42,16 @@ AWS backend for **R2Finance** — DynamoDB ledger + YNAB bidirectional sync.
 | GET | `/v1/inbox` | Unapproved + uncategorized (YNAB-style needs-attention) |
 | POST | `/v1/sync/import` | Full import |
 | POST | `/v1/sync/pull` | Delta pull |
-| POST | `/v1/sync/push` | Push pending |
+| POST | `/v1/sync/push` | Push pending DDB → YNAB |
 | POST | `/v1/sync/tick` | Pull then push |
+| POST | `/v1/device/push` | **Phone → DDB** offline queue (no YNAB wait) |
 | POST | `/v1/transactions/categorize` | Categorize in DDB → push YNAB |
 | POST | `/v1/transactions/approve` | Approve in DDB → push YNAB |
 | POST | `/v1/auth/forgot-password` | Email one-time reset link → finance.i-liquid.be |
 | POST | `/v1/auth/reset-password` | Set new password with token from email |
+| POST | `/v1/auth/invite` | Admin session only — create user + email set-password (CC admin) |
+
+Password / invite mail is sent from **`no-reply@i-liquid.be`** (SES + DKIM on `i-liquid.be`).
 
 ## Deploy
 
