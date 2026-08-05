@@ -6,7 +6,7 @@
   "main": "src/handlers/apiHandler.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "lint": "node -c src/lib/ynab.js && node -c src/lib/ddb.js && node -c src/lib/sync.js && node -c src/lib/secrets.js && node -c src/lib/plaid.js && node -c src/lib/connectors.js && node -c src/handlers/apiHandler.js && node -c src/handlers/ynabPull.js && node -c src/handlers/ynabPush.js && node -c src/handlers/fullImport.js",
+    "lint": "node -c src/lib/ynab.js && node -c src/lib/ddb.js && node -c src/lib/sync.js && node -c src/lib/secrets.js && node -c src/lib/ssm.js && node -c src/lib/plaid.js && node -c src/lib/connectors.js && node -c src/handlers/apiHandler.js && node -c src/handlers/ynabPull.js && node -c src/handlers/ynabPush.js && node -c src/handlers/fullImport.js",
     "deploy": "bash scripts/deploy.sh",
     "import": "bash scripts/invoke-import.sh"
   },
@@ -17,6 +17,7 @@
     "@aws-sdk/client-dynamodb": "^3.758.0",
     "@aws-sdk/client-secrets-manager": "^3.758.0",
     "@aws-sdk/client-ses": "^3.1103.0",
+    "@aws-sdk/client-ssm": "^3.758.0",
     "@aws-sdk/lib-dynamodb": "^3.758.0"
   }
 }

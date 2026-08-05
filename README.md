@@ -64,24 +64,25 @@ Password / invite mail is sent from **`no-reply@i-liquid.be`** (SES + DKIM on `i
 Establishes read access to **Bank of America** and **Chase** (credit cards / deposits) via [Plaid Link](https://plaid.com).  
 **Does not** write bank transactions into DynamoDB ledger `TXN#` rows yet.
 
+**Plaid keys never live in git.** They are SSM SecureString parameters only.
+
 1. Create a Plaid account → Dashboard API keys.
 2. Register OAuth redirect URI (no query string — Plaid rejects those):
    - `https://finance.i-liquid.be/connectors`
-3. Put credentials in Secrets Manager:
+3. Put credentials in **SSM** (not the repo, not Secrets Manager):
 
 ```bash
-aws secretsmanager create-secret --name R2Finance/plaid --secret-string '{
-  "client_id": "…",
-  "secret": "…",
-  "env": "sandbox"
-}' --region us-east-1
+# Replace placeholders — do not commit the real values
+aws ssm put-parameter --name /r2finance/plaid --type SecureString \
+  --value '{"client_id":"YOUR_ID","secret":"YOUR_SECRET","env":"production"}' \
+  --overwrite --region us-east-1
 # env: sandbox | development | production
 ```
 
 4. On the website: **Connectors → Connect Bank of America / Connect Chase**.
-5. Item tokens:
-   - BoA → `R2Finance/connectors/boa`
-   - Chase → `R2Finance/connectors/chase`
+5. Item access tokens (written after Link succeeds):
+   - BoA → SSM `/r2finance/connectors/boa`
+   - Chase → SSM `/r2finance/connectors/chase`
 
 ## Deploy
 

@@ -2,12 +2,12 @@
 
 /**
  * Thin Plaid REST client (no SDK) for bank connectors.
- * Credentials live in Secrets Manager — never in the browser.
+ * Credentials live in SSM SecureString (/r2finance/plaid) — never in git or the browser.
  */
 
-const secrets = require('./secrets');
+const ssm = require('./ssm');
 const {
-  plaidSecretId,
+  plaidSsmParam,
   plaidEnv,
   websiteBaseUrl,
 } = require('./config');
@@ -33,17 +33,26 @@ async function getPlaidCreds() {
   if (credsCache) return credsCache;
   let raw;
   try {
-    raw = await secrets.getSecretJson(plaidSecretId, { cache: true });
+    raw = await ssm.getParameterJson(plaidSsmParam, {
+      decrypt: true,
+      useCache: true,
+    });
   } catch (e) {
-    if (e.name === 'ResourceNotFoundException') {
-      const err = new Error(
-        'Plaid not configured. Create secret R2Finance/plaid with client_id, secret, env.',
-      );
-      err.status = 503;
-      err.code = 'plaid_not_configured';
-      throw err;
-    }
-    throw e;
+    const err = new Error(
+      `Plaid not configured. Put JSON {client_id, secret, env} in SSM ${plaidSsmParam}.`,
+    );
+    err.status = 503;
+    err.code = 'plaid_not_configured';
+    err.cause = e;
+    throw err;
+  }
+  if (!raw || typeof raw !== 'object') {
+    const err = new Error(
+      `Plaid not configured. Missing SSM SecureString ${plaidSsmParam}.`,
+    );
+    err.status = 503;
+    err.code = 'plaid_not_configured';
+    throw err;
   }
   const clientId = (raw.client_id || raw.clientId || '').trim();
   const secret = (raw.secret || raw.client_secret || '').trim();
@@ -52,7 +61,7 @@ async function getPlaidCreds() {
     .toLowerCase();
   if (!clientId || !secret || clientId === 'REPLACE_ME') {
     const err = new Error(
-      'Plaid credentials missing. Set client_id + secret on secret R2Finance/plaid.',
+      `Plaid credentials missing. Set client_id + secret on SSM ${plaidSsmParam}.`,
     );
     err.status = 503;
     err.code = 'plaid_not_configured';
@@ -71,6 +80,7 @@ async function getPlaidCreds() {
 
 function clearPlaidCache() {
   credsCache = undefined;
+  ssm.clearSsmCache();
 }
 
 async function plaidPost(path, body = {}) {

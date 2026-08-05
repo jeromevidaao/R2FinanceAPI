@@ -36,7 +36,7 @@ deploy_fn() {
       --timeout "$timeout" \
       --memory-size "$memory" \
       --role "$ROLE_ARN" \
-      --environment "Variables={R2FINANCE_TABLE=R2Finance,YNAB_SECRET_ID=R2Finance/ynab-pat,R2FINANCE_PLAN_ID=default,R2FINANCE_WEBSITE_URL=https://finance.i-liquid.be,R2FINANCE_RESET_FROM=no-reply@i-liquid.be,PLAID_SECRET_ID=R2Finance/plaid,BOA_ITEM_SECRET_ID=R2Finance/connectors/boa,CHASE_ITEM_SECRET_ID=R2Finance/connectors/chase}" \
+      --environment "Variables={R2FINANCE_TABLE=R2Finance,YNAB_SECRET_ID=R2Finance/ynab-pat,R2FINANCE_PLAN_ID=default,R2FINANCE_WEBSITE_URL=https://finance.i-liquid.be,R2FINANCE_RESET_FROM=no-reply@i-liquid.be,PLAID_SSM_PARAM=/r2finance/plaid,BOA_ITEM_SSM_PARAM=/r2finance/connectors/boa,CHASE_ITEM_SSM_PARAM=/r2finance/connectors/chase}" \
       --region "$REGION" >/dev/null
   else
     echo "Create $name"
@@ -48,7 +48,7 @@ deploy_fn() {
       --timeout "$timeout" \
       --memory-size "$memory" \
       --zip-file "fileb://$ZIP" \
-      --environment "Variables={R2FINANCE_TABLE=R2Finance,YNAB_SECRET_ID=R2Finance/ynab-pat,R2FINANCE_PLAN_ID=default,R2FINANCE_WEBSITE_URL=https://finance.i-liquid.be,R2FINANCE_RESET_FROM=no-reply@i-liquid.be,PLAID_SECRET_ID=R2Finance/plaid,BOA_ITEM_SECRET_ID=R2Finance/connectors/boa,CHASE_ITEM_SECRET_ID=R2Finance/connectors/chase}" \
+      --environment "Variables={R2FINANCE_TABLE=R2Finance,YNAB_SECRET_ID=R2Finance/ynab-pat,R2FINANCE_PLAN_ID=default,R2FINANCE_WEBSITE_URL=https://finance.i-liquid.be,R2FINANCE_RESET_FROM=no-reply@i-liquid.be,PLAID_SSM_PARAM=/r2finance/plaid,BOA_ITEM_SSM_PARAM=/r2finance/connectors/boa,CHASE_ITEM_SSM_PARAM=/r2finance/connectors/chase}" \
       --tags "Project=R2Finance" \
       --region "$REGION" >/dev/null
   fi

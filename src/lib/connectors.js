@@ -4,18 +4,19 @@
  * Bank connectors (Plaid).
  *
  * Phase 1 — establish access only:
- *  - Store Plaid item access_token in Secrets Manager
+ *  - Store Plaid item access_token in SSM SecureString (/r2finance/connectors/*)
+ *  - API keys in SSM /r2finance/plaid (never git)
  *  - Store non-secret connection metadata in DDB (CONNECTOR#…)
  *  - Probe live accounts/balances via Plaid
  *  - Do NOT write bank transactions into DDB TXN# / ledger rows
  */
 
 const ddb = require('./ddb');
-const secrets = require('./secrets');
+const ssm = require('./ssm');
 const plaid = require('./plaid');
 const {
-  boaItemSecretId,
-  chaseItemSecretId,
+  boaItemSsmParam,
+  chaseItemSsmParam,
   ledgerPlanId,
 } = require('./config');
 
@@ -26,7 +27,8 @@ const BANKS = {
     name: 'Bank of America',
     institutionId: plaid.BOA_INSTITUTION_ID,
     sk: 'CONNECTOR#BOA',
-    secretId: boaItemSecretId,
+    /** SSM SecureString path for Plaid item access_token — never in git. */
+    ssmParam: boaItemSsmParam,
     short: 'BoA',
   },
   chase: {
@@ -34,7 +36,7 @@ const BANKS = {
     name: 'Chase',
     institutionId: plaid.CHASE_INSTITUTION_ID,
     sk: 'CONNECTOR#CHASE',
-    secretId: chaseItemSecretId,
+    ssmParam: chaseItemSsmParam,
     short: 'Chase',
   },
 };
@@ -64,13 +66,12 @@ async function getMeta(bank, planId = ledgerPlanId) {
 }
 
 async function getAccessToken(bank) {
-  try {
-    const j = await secrets.getSecretJson(bank.secretId, { cache: false });
-    return (j.access_token || j.accessToken || '').trim() || null;
-  } catch (e) {
-    if (e.name === 'ResourceNotFoundException') return null;
-    throw e;
-  }
+  const j = await ssm.getParameterJson(bank.ssmParam, {
+    decrypt: true,
+    useCache: false,
+  });
+  if (!j) return null;
+  return (j.access_token || j.accessToken || '').trim() || null;
 }
 
 function mapAccount(a) {
@@ -166,8 +167,8 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
     /* optional */
   }
 
-  await secrets.putSecretJson(
-    bank.secretId,
+  await ssm.putParameterJson(
+    bank.ssmParam,
     {
       access_token: accessToken,
       item_id: itemId,
@@ -271,9 +272,9 @@ async function disconnect(bankId, planId = ledgerPlanId) {
     }
   }
   try {
-    await secrets.deleteSecret(bank.secretId);
+    await ssm.deleteParameter(bank.ssmParam);
   } catch (e) {
-    console.warn(`delete ${bank.id} item secret`, e.message);
+    console.warn(`delete ${bank.id} item SSM param`, e.message);
   }
 
   const existing = await getMeta(bank, planId);

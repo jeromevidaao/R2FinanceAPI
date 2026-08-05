@@ -16,14 +16,17 @@ module.exports = {
   resetFromEmail: process.env.R2FINANCE_RESET_FROM || 'no-reply@i-liquid.be',
   /** Password-reset token lifetime (ms). */
   resetTokenTtlMs: Number(process.env.R2FINANCE_RESET_TTL_MS || 60 * 60 * 1000),
-  /** Plaid API credentials secret (JSON: client_id, secret, env). */
-  plaidSecretId: process.env.PLAID_SECRET_ID || 'R2Finance/plaid',
-  /** Plaid env fallback if secret omits env. */
+  /**
+   * Plaid API credentials — SSM SecureString path (JSON: client_id, secret, env).
+   * Never commit real keys; set only via AWS CLI / console.
+   */
+  plaidSsmParam: process.env.PLAID_SSM_PARAM || '/r2finance/plaid',
+  /** Plaid env fallback if SSM param omits env. */
   plaidEnv: process.env.PLAID_ENV || 'sandbox',
-  /** Connected Bank of America item access_token secret. */
-  boaItemSecretId:
-    process.env.BOA_ITEM_SECRET_ID || 'R2Finance/connectors/boa',
-  /** Connected Chase item access_token secret. */
-  chaseItemSecretId:
-    process.env.CHASE_ITEM_SECRET_ID || 'R2Finance/connectors/chase',
+  /** Connected Bank of America item access_token — SSM SecureString. */
+  boaItemSsmParam:
+    process.env.BOA_ITEM_SSM_PARAM || '/r2finance/connectors/boa',
+  /** Connected Chase item access_token — SSM SecureString. */
+  chaseItemSsmParam:
+    process.env.CHASE_ITEM_SSM_PARAM || '/r2finance/connectors/chase',
 };
