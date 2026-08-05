@@ -1,13 +1,16 @@
 'use strict';
 
 /**
- * Bank connectors (Plaid).
+ * Bank connectors (Plaid) — per-user, keyed by email.
  *
  * Phase 1 — establish access only:
- *  - Store Plaid item access_token in SSM SecureString (/r2finance/connectors/*)
+ *  - One independent connection per (email × bank)
+ *    e.g. Jerome BoA + Ngoc BoA = 2 separate Items
+ *  - Plaid access_token in SSM SecureString:
+ *      /r2finance/connectors/{userKey}/{bankId}
+ *  - Metadata in DDB:
+ *      pk=USER#{email}  sk=CONNECTOR#{BANK}
  *  - API keys in SSM /r2finance/plaid (never git)
- *  - Store non-secret connection metadata in DDB (CONNECTOR#…)
- *  - Probe live accounts/balances via Plaid
  *  - Do NOT write bank transactions into DDB TXN# / ledger rows
  */
 
@@ -15,32 +18,53 @@ const crypto = require('crypto');
 const ddb = require('./ddb');
 const ssm = require('./ssm');
 const plaid = require('./plaid');
-const {
-  boaItemSsmParam,
-  chaseItemSsmParam,
-  vanguardItemSsmParam,
-  ledgerPlanId,
-} = require('./config');
+const auth = require('./auth');
+const { ledgerPlanId } = require('./config');
 
 /**
- * Plaid forbids emails/PII in user.client_user_id — use a stable hash instead.
+ * Plaid forbids emails/PII in user.client_user_id — use a stable hash.
  */
 function plaidClientUserId(email) {
-  const raw = String(email || 'r2finance')
-    .trim()
-    .toLowerCase();
-  return crypto.createHash('sha256').update(`r2finance:${raw}`).digest('hex').slice(0, 32);
+  const raw = normalizeEmail(email) || 'r2finance';
+  return crypto
+    .createHash('sha256')
+    .update(`r2finance:${raw}`)
+    .digest('hex')
+    .slice(0, 32);
 }
 
-/** Supported bank connectors (access-only). */
+function normalizeEmail(email) {
+  return String(email || '')
+    .trim()
+    .toLowerCase();
+}
+
+/** Opaque user key for SSM paths (no email/PII in parameter names). */
+function userKey(email) {
+  return crypto
+    .createHash('sha256')
+    .update(`r2u:${normalizeEmail(email)}`)
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function requireEmail(email) {
+  const e = normalizeEmail(email);
+  if (!e) {
+    const err = new Error('email required for connector');
+    err.status = 400;
+    throw err;
+  }
+  return e;
+}
+
+/** Supported bank types (generic catalog). */
 const BANKS = {
   boa: {
     id: 'boa',
     name: 'Bank of America',
     institutionId: plaid.BOA_INSTITUTION_ID,
-    sk: 'CONNECTOR#BOA',
-    /** SSM SecureString path for Plaid item access_token — never in git. */
-    ssmParam: boaItemSsmParam,
+    bankSk: 'CONNECTOR#BOA',
     short: 'BoA',
     products: ['transactions'],
   },
@@ -48,8 +72,7 @@ const BANKS = {
     id: 'chase',
     name: 'Chase',
     institutionId: plaid.CHASE_INSTITUTION_ID,
-    sk: 'CONNECTOR#CHASE',
-    ssmParam: chaseItemSsmParam,
+    bankSk: 'CONNECTOR#CHASE',
     short: 'Chase',
     products: ['transactions'],
   },
@@ -57,14 +80,11 @@ const BANKS = {
     id: 'vanguard',
     name: 'Vanguard',
     institutionId: plaid.VANGUARD_INSTITUTION_ID,
-    sk: 'CONNECTOR#VANGUARD',
-    ssmParam: vanguardItemSsmParam,
+    bankSk: 'CONNECTOR#VANGUARD',
     short: 'VG',
-    // Brokerage / retirement accounts
     products: ['investments'],
   },
 };
-
 
 function resolveBank(bankId) {
   const key = String(bankId || '')
@@ -82,16 +102,34 @@ function resolveBank(bankId) {
   return bank;
 }
 
-function metaKey(bank, planId = ledgerPlanId) {
-  return { pk: ddb.planPk(planId), sk: bank.sk };
+function userPk(email) {
+  return `USER#${normalizeEmail(email)}`;
 }
 
-async function getMeta(bank, planId = ledgerPlanId) {
-  return ddb.getItem(ddb.planPk(planId), bank.sk);
+function metaKey(bank, email) {
+  return { pk: userPk(email), sk: bank.bankSk };
 }
 
-async function getAccessToken(bank) {
-  const j = await ssm.getParameterJson(bank.ssmParam, {
+/** Per-user SSM path for item access_token. */
+function itemSsmParam(bank, email) {
+  return `/r2finance/connectors/${userKey(email)}/${bank.id}`;
+}
+
+/** Legacy plan-level paths (pre multi-user) — migration only. */
+function legacyPlanSsmParam(bankId) {
+  return `/r2finance/connectors/${bankId}`;
+}
+
+function legacyPlanMetaSk(bank) {
+  return bank.bankSk;
+}
+
+async function getMeta(bank, email) {
+  return ddb.getItem(userPk(email), bank.bankSk);
+}
+
+async function getAccessToken(bank, email) {
+  const j = await ssm.getParameterJson(itemSsmParam(bank, email), {
     decrypt: true,
     useCache: false,
   });
@@ -117,17 +155,97 @@ function mapAccount(a) {
 }
 
 /**
- * Status for UI — never returns access_token.
+ * One-time migration: plan-level CONNECTOR#* → USER#email when this email owns it.
+ * Safe to call on every status/list (no-op if already migrated).
  */
-async function status(bankId, planId = ledgerPlanId) {
+async function migrateLegacyForUser(email) {
+  const e = normalizeEmail(email);
+  if (!e) return { migrated: [] };
+  const migrated = [];
+
+  for (const bank of Object.values(BANKS)) {
+    const existing = await getMeta(bank, e);
+    if (existing?.connected && existing?.itemId) continue;
+
+    const legacy = await ddb.getItem(
+      ddb.planPk(ledgerPlanId),
+      legacyPlanMetaSk(bank),
+    );
+    if (!legacy?.connected) continue;
+
+    // Only adopt legacy rows owned by this email (or unowned → first admin)
+    const owner = normalizeEmail(legacy.connectedBy || '');
+    const isAdmin = e === normalizeEmail(auth.ALLOWED_EMAIL);
+    if (owner && owner !== e) continue;
+    if (!owner && !isAdmin) continue;
+
+    // Prefer per-user SSM; fall back to legacy plan-level param
+    let tokenJson = await ssm.getParameterJson(itemSsmParam(bank, e), {
+      decrypt: true,
+      useCache: false,
+    });
+    if (!tokenJson?.access_token) {
+      tokenJson = await ssm.getParameterJson(legacyPlanSsmParam(bank.id), {
+        decrypt: true,
+        useCache: false,
+      });
+      if (tokenJson?.access_token) {
+        await ssm.putParameterJson(
+          itemSsmParam(bank, e),
+          {
+            ...tokenJson,
+            email: e,
+            connector_id: bank.id,
+            migratedFrom: legacyPlanSsmParam(bank.id),
+            updatedAt: new Date().toISOString(),
+          },
+          {
+            description: `R2Finance ${bank.name} item for ${e} (migrated)`,
+          },
+        );
+      }
+    }
+
+    await ddb.putItem({
+      ...metaKey(bank, e),
+      entityType: 'CONNECTOR',
+      connectorId: bank.id,
+      provider: 'plaid',
+      email: e,
+      userKey: userKey(e),
+      connected: true,
+      itemId: legacy.itemId || tokenJson?.item_id || null,
+      institutionId: legacy.institutionId || null,
+      institutionName: legacy.institutionName || bank.name,
+      accountCount: legacy.accountCount ?? 0,
+      accountsPreview: legacy.accountsPreview || [],
+      connectedAt: legacy.connectedAt || Date.now(),
+      connectedBy: e,
+      importTransactionsToDdb: false,
+      migratedFrom: `PLAN#${ledgerPlanId}/${bank.bankSk}`,
+      updatedAt: Date.now(),
+    });
+    migrated.push(bank.id);
+  }
+  return { migrated };
+}
+
+/**
+ * Status for one bank for one user — never returns access_token.
+ */
+async function status(bankId, { email } = {}) {
+  const e = requireEmail(email);
+  await migrateLegacyForUser(e);
   const bank = resolveBank(bankId);
   const configured = await plaid.isConfigured();
-  const meta = await getMeta(bank, planId);
-  const hasToken = !!(await getAccessToken(bank));
+  const meta = await getMeta(bank, e);
+  const hasToken = !!(await getAccessToken(bank, e));
   const connected = !!(meta?.connected && hasToken);
 
   return {
     connectorId: bank.id,
+    email: e,
+    userKey: userKey(e),
     provider: 'plaid',
     institution: bank.name,
     institutionId: meta?.institutionId || bank.institutionId,
@@ -135,28 +253,65 @@ async function status(bankId, planId = ledgerPlanId) {
     connected,
     itemId: meta?.itemId || null,
     connectedAt: meta?.connectedAt || null,
-    connectedBy: meta?.connectedBy || null,
+    connectedBy: meta?.connectedBy || e,
     institutionName: meta?.institutionName || bank.name,
     accountCount: meta?.accountCount ?? null,
     accountsPreview: meta?.accountsPreview || [],
     note:
-      'Access only — bank transactions are not written to the R2Finance DDB ledger yet.',
+      'Per-user access only — bank transactions are not written to the R2Finance DDB ledger yet.',
   };
 }
 
-async function listStatus(planId = ledgerPlanId) {
+/** Banks for the signed-in user only. */
+async function listStatus({ email } = {}) {
+  const e = requireEmail(email);
+  await migrateLegacyForUser(e);
   const connectors = [];
   for (const id of Object.keys(BANKS)) {
-    connectors.push(await status(id, planId));
+    connectors.push(await status(id, { email: e }));
   }
-  return { connectors };
+  return { email: e, connectors };
 }
 
 /**
- * Exchange Plaid public_token → access_token; store secrets + meta.
- * Does not import transactions into DDB.
+ * Household overview: every allowed email × every bank (status only).
+ * Used so each person can see who has what linked.
+ */
+async function listHousehold({ email } = {}) {
+  const requester = requireEmail(email);
+  const users = auth.ALLOWED_EMAILS || [requester];
+  const byUser = [];
+  for (const u of users) {
+    const connectors = [];
+    for (const id of Object.keys(BANKS)) {
+      // migrate only for requester's legacy; others already user-scoped
+      if (normalizeEmail(u) === requester) await migrateLegacyForUser(u);
+      const bank = resolveBank(id);
+      const configured = await plaid.isConfigured();
+      const meta = await getMeta(bank, u);
+      const hasToken = !!(await getAccessToken(bank, u));
+      connectors.push({
+        connectorId: bank.id,
+        email: normalizeEmail(u),
+        institution: bank.name,
+        institutionName: meta?.institutionName || bank.name,
+        configured,
+        connected: !!(meta?.connected && hasToken),
+        accountCount: meta?.accountCount ?? null,
+        connectedAt: meta?.connectedAt || null,
+        itemId: meta?.itemId || null,
+      });
+    }
+    byUser.push({ email: normalizeEmail(u), connectors });
+  }
+  return { requester, users: byUser };
+}
+
+/**
+ * Exchange Plaid public_token → access_token; store under this email.
  */
 async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
+  const e = requireEmail(email);
   const bank = resolveBank(bankId);
   if (!publicToken) {
     const err = new Error('publicToken required');
@@ -179,8 +334,8 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
     if (acctRes.item?.institution_id) {
       institutionId = acctRes.item.institution_id;
     }
-  } catch (e) {
-    console.warn('accounts/get after exchange failed', e.message);
+  } catch (err) {
+    console.warn('accounts/get after exchange failed', err.message);
   }
 
   try {
@@ -193,15 +348,17 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
   }
 
   await ssm.putParameterJson(
-    bank.ssmParam,
+    itemSsmParam(bank, e),
     {
       access_token: accessToken,
       item_id: itemId,
       institution_id: institutionId,
       connector_id: bank.id,
+      email: e,
+      userKey: userKey(e),
       updatedAt: new Date().toISOString(),
     },
-    { description: `R2Finance ${bank.name} Plaid item access token` },
+    { description: `R2Finance ${bank.name} Plaid item for user` },
   );
 
   const now = Date.now();
@@ -214,10 +371,12 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
   }));
 
   await ddb.putItem({
-    ...metaKey(bank),
+    ...metaKey(bank, e),
     entityType: 'CONNECTOR',
     connectorId: bank.id,
     provider: 'plaid',
+    email: e,
+    userKey: userKey(e),
     connected: true,
     itemId,
     institutionId,
@@ -225,7 +384,7 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
     accountCount: accounts.length,
     accountsPreview: preview,
     connectedAt: now,
-    connectedBy: email || null,
+    connectedBy: e,
     importTransactionsToDdb: false,
     updatedAt: now,
   });
@@ -234,6 +393,7 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
     ok: true,
     connected: true,
     connectorId: bank.id,
+    email: e,
     itemId,
     institutionId,
     institutionName,
@@ -242,14 +402,13 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
   };
 }
 
-/**
- * Live probe of accounts via Plaid (not from DDB ledger).
- */
-async function probeAccounts(bankId, planId = ledgerPlanId) {
+async function probeAccounts(bankId, { email } = {}) {
+  const e = requireEmail(email);
+  await migrateLegacyForUser(e);
   const bank = resolveBank(bankId);
-  const accessToken = await getAccessToken(bank);
+  const accessToken = await getAccessToken(bank, e);
   if (!accessToken) {
-    const err = new Error(`${bank.name} not connected`);
+    const err = new Error(`${bank.name} not connected for ${e}`);
     err.status = 404;
     err.code = 'not_connected';
     throw err;
@@ -257,7 +416,7 @@ async function probeAccounts(bankId, planId = ledgerPlanId) {
 
   const acctRes = await plaid.getAccounts(accessToken);
   const accounts = (acctRes.accounts || []).map(mapAccount);
-  const meta = await getMeta(bank, planId);
+  const meta = await getMeta(bank, e);
 
   if (meta) {
     await ddb.putItem({
@@ -278,6 +437,7 @@ async function probeAccounts(bankId, planId = ledgerPlanId) {
   return {
     ok: true,
     connectorId: bank.id,
+    email: e,
     institutionName: meta?.institutionName || bank.name,
     itemId: meta?.itemId || acctRes.item?.item_id || null,
     accounts,
@@ -286,23 +446,24 @@ async function probeAccounts(bankId, planId = ledgerPlanId) {
   };
 }
 
-async function disconnect(bankId, planId = ledgerPlanId) {
+async function disconnect(bankId, { email } = {}) {
+  const e = requireEmail(email);
   const bank = resolveBank(bankId);
-  const accessToken = await getAccessToken(bank);
+  const accessToken = await getAccessToken(bank, e);
   if (accessToken) {
     try {
       await plaid.removeItem(accessToken);
-    } catch (e) {
-      console.warn('plaid item/remove', e.message);
+    } catch (err) {
+      console.warn('plaid item/remove', err.message);
     }
   }
   try {
-    await ssm.deleteParameter(bank.ssmParam);
-  } catch (e) {
-    console.warn(`delete ${bank.id} item SSM param`, e.message);
+    await ssm.deleteParameter(itemSsmParam(bank, e));
+  } catch (err) {
+    console.warn(`delete ${bank.id} item SSM`, err.message);
   }
 
-  const existing = await getMeta(bank, planId);
+  const existing = await getMeta(bank, e);
   if (existing) {
     await ddb.putItem({
       ...existing,
@@ -315,13 +476,14 @@ async function disconnect(bankId, planId = ledgerPlanId) {
     });
   }
 
-  return { ok: true, connected: false, connectorId: bank.id };
+  return { ok: true, connected: false, connectorId: bank.id, email: e };
 }
 
 async function createLinkToken(bankId, { email } = {}) {
+  const e = requireEmail(email);
   const bank = resolveBank(bankId);
   return plaid.createLinkToken({
-    clientUserId: plaidClientUserId(email),
+    clientUserId: plaidClientUserId(e),
     institutionId: bank.institutionId,
     bankKey: bank.id,
     products: bank.products || ['transactions'],
@@ -331,13 +493,15 @@ async function createLinkToken(bankId, { email } = {}) {
 module.exports = {
   BANKS,
   resolveBank,
+  userKey,
+  plaidClientUserId,
+  itemSsmParam,
   status,
   listStatus,
+  listHousehold,
   exchangeAndStore,
   probeAccounts,
   disconnect,
   createLinkToken,
-  CONNECTOR_SK_BOA: BANKS.boa.sk,
-  CONNECTOR_SK_CHASE: BANKS.chase.sk,
-  CONNECTOR_SK_VANGUARD: BANKS.vanguard.sk,
+  migrateLegacyForUser,
 };

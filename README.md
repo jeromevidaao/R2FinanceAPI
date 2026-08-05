@@ -59,12 +59,19 @@ Phone (Room)  ──POST /v1/device/push──►  DynamoDB  ──pushPending /
 
 Password / invite mail is sent from **`no-reply@i-liquid.be`** (SES + DKIM on `i-liquid.be`).
 
-### Bank connectors (Plaid) — BoA + Chase + Vanguard
+### Bank connectors (Plaid) — per email × bank
 
-Establishes read access to **Bank of America**, **Chase** (credit cards / deposits), and **Vanguard** (investments) via [Plaid Link](https://plaid.com).  
-**Does not** write bank transactions into DynamoDB ledger `TXN#` rows yet.
+Generic bank catalog: **Bank of America**, **Chase**, **Vanguard**.  
+Each **household member** (signed-in email) has their own independent links — so the household can have 2× BoA, 2× Chase, 2× Vanguard.
 
-**Plaid keys never live in git.** They are SSM SecureString parameters only.
+| Layer | Keying |
+|-------|--------|
+| DDB metadata | `pk=USER#{email}` · `sk=CONNECTOR#{BANK}` |
+| SSM item token | `/r2finance/connectors/{userKey}/{bankId}` (`userKey` = opaque hash, no email in path) |
+| Session | Connect / disconnect / probe always use the bearer session email |
+
+**Does not** write bank transactions into DynamoDB ledger `TXN#` rows yet.  
+**Plaid keys never live in git** — SSM `/r2finance/plaid` only.
 
 1. Create a Plaid account → Dashboard API keys.
 2. Register OAuth redirect URI (no query string — Plaid rejects those):
@@ -79,11 +86,9 @@ aws ssm put-parameter --name /r2finance/plaid --type SecureString \
 # env: sandbox | development | production
 ```
 
-4. On the website: **Connectors → Connect Bank of America / Chase / Vanguard**.
-5. Item access tokens (written after Link succeeds):
-   - BoA → SSM `/r2finance/connectors/boa`
-   - Chase → SSM `/r2finance/connectors/chase`
-   - Vanguard → SSM `/r2finance/connectors/vanguard`
+4. Each person signs in → **Connectors** → links their own banks.
+5. Item tokens: SSM `/r2finance/connectors/{userKey}/{boa|chase|vanguard}`.
+6. Household matrix: `GET /v1/connectors?household=1`.
 
 ## Deploy
 

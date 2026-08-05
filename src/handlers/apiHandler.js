@@ -281,12 +281,17 @@ exports.handler = async (event) => {
       });
     }
 
-    // ── Bank connectors (Plaid) ───────────────────────────────────────
+    // ── Bank connectors (Plaid) — per signed-in email ─────────────────
     // Access only — never write bank transactions into DDB ledger TXN#.
-    // Supported: boa, chase (see connectors.BANKS).
+    // Supported banks: boa, chase, vanguard (see connectors.BANKS).
+    // Each household member has their own set (2× BoA, 2× Chase, 2× VG).
     if (method === 'GET' && path === '/v1/connectors') {
-      await requireSession(event);
-      return json(200, await connectors.listStatus());
+      const session = await requireSession(event);
+      const qs = event?.queryStringParameters || {};
+      if (qs.household === '1' || qs.household === 'true') {
+        return json(200, await connectors.listHousehold({ email: session.email }));
+      }
+      return json(200, await connectors.listStatus({ email: session.email }));
     }
 
     const connectorMatch = path.match(
@@ -297,8 +302,11 @@ exports.handler = async (event) => {
       const action = connectorMatch[2] || null;
 
       if (method === 'GET' && !action) {
-        await requireSession(event);
-        return json(200, await connectors.status(bankId));
+        const session = await requireSession(event);
+        return json(
+          200,
+          await connectors.status(bankId, { email: session.email }),
+        );
       }
 
       if (method === 'POST' && action === 'link-token') {
@@ -313,6 +321,7 @@ exports.handler = async (event) => {
           request_id: out.request_id,
           connectorId: bank.id,
           institution: bank.name,
+          email: session.email,
         });
       }
 
@@ -328,13 +337,19 @@ exports.handler = async (event) => {
       }
 
       if (method === 'GET' && action === 'accounts') {
-        await requireSession(event);
-        return json(200, await connectors.probeAccounts(bankId));
+        const session = await requireSession(event);
+        return json(
+          200,
+          await connectors.probeAccounts(bankId, { email: session.email }),
+        );
       }
 
       if (method === 'POST' && action === 'disconnect') {
-        await requireSession(event);
-        return json(200, await connectors.disconnect(bankId));
+        const session = await requireSession(event);
+        return json(
+          200,
+          await connectors.disconnect(bankId, { email: session.email }),
+        );
       }
     }
 

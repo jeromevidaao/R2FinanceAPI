@@ -27,16 +27,23 @@ describe('Plaid / bank connector helpers', () => {
   });
 
   it('plaid client_user_id is not an email', () => {
-    // exercise via createLinkToken wiring — hash must not look like email
-    const crypto = require('crypto');
-    const email = 'jerome.ans@gmail.com';
-    const id = crypto
-      .createHash('sha256')
-      .update(`r2finance:${email}`)
-      .digest('hex')
-      .slice(0, 32);
+    const id = connectors.plaidClientUserId('jerome.ans@gmail.com');
     assert.equal(id.includes('@'), false);
     assert.match(id, /^[a-f0-9]{32}$/);
+  });
+
+  it('userKey is stable and opaque (no email in SSM path)', () => {
+    const a = connectors.userKey('jerome.ans@gmail.com');
+    const b = connectors.userKey('Jerome.Ans@gmail.com');
+    const c = connectors.userKey('ngoc.h.dinh@gmail.com');
+    assert.equal(a, b);
+    assert.notEqual(a, c);
+    assert.match(a, /^[a-f0-9]{16}$/);
+    assert.equal(a.includes('@'), false);
+    assert.equal(
+      connectors.itemSsmParam(connectors.resolveBank('boa'), 'jerome.ans@gmail.com'),
+      `/r2finance/connectors/${a}/boa`,
+    );
   });
 
   it('isConfigured is false without secret credentials', async () => {

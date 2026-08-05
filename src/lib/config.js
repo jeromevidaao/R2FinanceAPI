@@ -23,13 +23,9 @@ module.exports = {
   plaidSsmParam: process.env.PLAID_SSM_PARAM || '/r2finance/plaid',
   /** Plaid env fallback if SSM param omits env. */
   plaidEnv: process.env.PLAID_ENV || 'sandbox',
-  /** Connected Bank of America item access_token — SSM SecureString. */
-  boaItemSsmParam:
-    process.env.BOA_ITEM_SSM_PARAM || '/r2finance/connectors/boa',
-  /** Connected Chase item access_token — SSM SecureString. */
-  chaseItemSsmParam:
-    process.env.CHASE_ITEM_SSM_PARAM || '/r2finance/connectors/chase',
-  /** Connected Vanguard item access_token — SSM SecureString. */
-  vanguardItemSsmParam:
-    process.env.VANGUARD_ITEM_SSM_PARAM || '/r2finance/connectors/vanguard',
+  /**
+   * Per-user item tokens:
+   *   /r2finance/connectors/{userKey}/{boa|chase|vanguard}
+   * userKey = sha256("r2u:"+email).slice(0,16) — no email in the path.
+   */
 };
