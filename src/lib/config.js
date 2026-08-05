@@ -23,4 +23,7 @@ module.exports = {
   /** Connected Bank of America item access_token secret. */
   boaItemSecretId:
     process.env.BOA_ITEM_SECRET_ID || 'R2Finance/connectors/boa',
+  /** Connected Chase item access_token secret. */
+  chaseItemSecretId:
+    process.env.CHASE_ITEM_SECRET_ID || 'R2Finance/connectors/chase',
 };

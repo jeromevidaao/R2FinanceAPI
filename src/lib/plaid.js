@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Thin Plaid REST client (no SDK) for Bank of America access.
+ * Thin Plaid REST client (no SDK) for bank connectors.
  * Credentials live in Secrets Manager — never in the browser.
  */
 
@@ -18,8 +18,14 @@ const HOSTS = {
   production: 'https://production.plaid.com',
 };
 
-/** Bank of America (US) institution id on Plaid. */
-const BOA_INSTITUTION_ID = 'ins_127989';
+/** Well-known US institution ids on Plaid. */
+const INSTITUTIONS = {
+  boa: { id: 'ins_127989', name: 'Bank of America' },
+  chase: { id: 'ins_56', name: 'Chase' },
+};
+
+const BOA_INSTITUTION_ID = INSTITUTIONS.boa.id;
+const CHASE_INSTITUTION_ID = INSTITUTIONS.chase.id;
 
 let credsCache;
 
@@ -53,7 +59,9 @@ async function getPlaidCreds() {
     throw err;
   }
   if (!HOSTS[env]) {
-    const err = new Error(`Invalid Plaid env "${env}" (use sandbox|development|production)`);
+    const err = new Error(
+      `Invalid Plaid env "${env}" (use sandbox|development|production)`,
+    );
     err.status = 500;
     throw err;
   }
@@ -99,12 +107,21 @@ async function plaidPost(path, body = {}) {
 }
 
 /**
- * Create a Link token pre-filtered to Bank of America.
+ * Create a Link token, optionally pre-filtered to one institution.
  * products=transactions so we can later read credit-card spend (not written to DDB yet).
  */
-async function createBoaLinkToken({ clientUserId, redirectUri }) {
+async function createLinkToken({
+  clientUserId,
+  redirectUri,
+  institutionId,
+  bankKey,
+} = {}) {
+  const base = websiteBaseUrl.replace(/\/$/, '');
   const uri =
-    redirectUri || `${websiteBaseUrl.replace(/\/$/, '')}/connectors`;
+    redirectUri ||
+    (bankKey
+      ? `${base}/connectors?bank=${encodeURIComponent(bankKey)}`
+      : `${base}/connectors`);
   const body = {
     user: { client_user_id: String(clientUserId || 'r2finance-user') },
     client_name: 'R2Finance',
@@ -112,9 +129,9 @@ async function createBoaLinkToken({ clientUserId, redirectUri }) {
     country_codes: ['US'],
     language: 'en',
     redirect_uri: uri,
-    // Pre-select Bank of America when Plaid allows institution_id on Link.
-    institution_id: BOA_INSTITUTION_ID,
   };
+  if (institutionId) body.institution_id = institutionId;
+
   try {
     return await plaidPost('/link/token/create', body);
   } catch (e) {
@@ -131,7 +148,6 @@ async function createBoaLinkToken({ clientUserId, redirectUri }) {
         country_codes: body.country_codes,
         language: body.language,
       };
-      // Keep redirect only if it looked like redirect was not the problem
       if (!/redirect/i.test(e.message || '')) {
         fallback.redirect_uri = uri;
       }
@@ -139,6 +155,23 @@ async function createBoaLinkToken({ clientUserId, redirectUri }) {
     }
     throw e;
   }
+}
+
+/** @deprecated use createLinkToken */
+async function createBoaLinkToken(opts) {
+  return createLinkToken({
+    ...opts,
+    institutionId: BOA_INSTITUTION_ID,
+    bankKey: 'boa',
+  });
+}
+
+async function createChaseLinkToken(opts) {
+  return createLinkToken({
+    ...opts,
+    institutionId: CHASE_INSTITUTION_ID,
+    bankKey: 'chase',
+  });
 }
 
 async function exchangePublicToken(publicToken) {
@@ -177,10 +210,14 @@ async function isConfigured() {
 }
 
 module.exports = {
+  INSTITUTIONS,
   BOA_INSTITUTION_ID,
+  CHASE_INSTITUTION_ID,
   getPlaidCreds,
   clearPlaidCache,
+  createLinkToken,
   createBoaLinkToken,
+  createChaseLinkToken,
   exchangePublicToken,
   getItem,
   getAccounts,

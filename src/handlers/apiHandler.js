@@ -281,43 +281,61 @@ exports.handler = async (event) => {
       });
     }
 
-    // ── Bank connectors (Plaid / Bank of America) ─────────────────────
+    // ── Bank connectors (Plaid) ───────────────────────────────────────
     // Access only — never write bank transactions into DDB ledger TXN#.
-    if (method === 'GET' && path === '/v1/connectors/boa') {
+    // Supported: boa, chase (see connectors.BANKS).
+    if (method === 'GET' && path === '/v1/connectors') {
       await requireSession(event);
-      return json(200, await connectors.status());
+      return json(200, await connectors.listStatus());
     }
 
-    if (method === 'POST' && path === '/v1/connectors/boa/link-token') {
-      const session = await requireSession(event);
-      const out = await connectors.createLinkToken({ email: session.email });
-      return json(200, {
-        link_token: out.link_token,
-        expiration: out.expiration,
-        request_id: out.request_id,
-        institution: 'Bank of America',
-      });
-    }
+    const connectorMatch = path.match(
+      /^\/v1\/connectors\/([a-z0-9_-]+)(?:\/(link-token|exchange|accounts|disconnect))?$/,
+    );
+    if (connectorMatch) {
+      const bankId = connectorMatch[1];
+      const action = connectorMatch[2] || null;
 
-    if (method === 'POST' && path === '/v1/connectors/boa/exchange') {
-      const session = await requireSession(event);
-      const body = parseBody(event);
-      const result = await connectors.exchangeAndStore({
-        publicToken: body.public_token || body.publicToken,
-        email: session.email,
-        metadata: body.metadata || null,
-      });
-      return json(200, result);
-    }
+      if (method === 'GET' && !action) {
+        await requireSession(event);
+        return json(200, await connectors.status(bankId));
+      }
 
-    if (method === 'GET' && path === '/v1/connectors/boa/accounts') {
-      await requireSession(event);
-      return json(200, await connectors.probeAccounts());
-    }
+      if (method === 'POST' && action === 'link-token') {
+        const session = await requireSession(event);
+        const bank = connectors.resolveBank(bankId);
+        const out = await connectors.createLinkToken(bankId, {
+          email: session.email,
+        });
+        return json(200, {
+          link_token: out.link_token,
+          expiration: out.expiration,
+          request_id: out.request_id,
+          connectorId: bank.id,
+          institution: bank.name,
+        });
+      }
 
-    if (method === 'POST' && path === '/v1/connectors/boa/disconnect') {
-      await requireSession(event);
-      return json(200, await connectors.disconnect());
+      if (method === 'POST' && action === 'exchange') {
+        const session = await requireSession(event);
+        const body = parseBody(event);
+        const result = await connectors.exchangeAndStore(bankId, {
+          publicToken: body.public_token || body.publicToken,
+          email: session.email,
+          metadata: body.metadata || null,
+        });
+        return json(200, result);
+      }
+
+      if (method === 'GET' && action === 'accounts') {
+        await requireSession(event);
+        return json(200, await connectors.probeAccounts(bankId));
+      }
+
+      if (method === 'POST' && action === 'disconnect') {
+        await requireSession(event);
+        return json(200, await connectors.disconnect(bankId));
+      }
     }
 
     return json(404, { error: 'not_found', path, method });

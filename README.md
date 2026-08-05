@@ -50,21 +50,25 @@ Phone (Room)  ──POST /v1/device/push──►  DynamoDB  ──pushPending /
 | POST | `/v1/auth/forgot-password` | Email one-time reset link → finance.i-liquid.be |
 | POST | `/v1/auth/reset-password` | Set new password with token from email |
 | POST | `/v1/auth/invite` | Admin session only — create user + email set-password (CC admin) |
-| GET | `/v1/connectors/boa` | Bank of America (Plaid) connection status (session required) |
-| POST | `/v1/connectors/boa/link-token` | Create Plaid Link token for BoA |
-| POST | `/v1/connectors/boa/exchange` | Exchange public_token → store access (Secrets Manager) |
-| GET | `/v1/connectors/boa/accounts` | Live probe of BoA accounts/balances (not DDB ledger) |
-| POST | `/v1/connectors/boa/disconnect` | Remove Plaid item + clear stored token |
+| GET | `/v1/connectors` | List bank connector statuses (session required) |
+| GET | `/v1/connectors/{boa\|chase}` | Connection status for one bank |
+| POST | `/v1/connectors/{boa\|chase}/link-token` | Create Plaid Link token |
+| POST | `/v1/connectors/{boa\|chase}/exchange` | Exchange public_token → store access |
+| GET | `/v1/connectors/{boa\|chase}/accounts` | Live probe accounts/balances (not DDB ledger) |
+| POST | `/v1/connectors/{boa\|chase}/disconnect` | Remove Plaid item + clear stored token |
 
 Password / invite mail is sent from **`no-reply@i-liquid.be`** (SES + DKIM on `i-liquid.be`).
 
-### Bank of America connector (Plaid)
+### Bank connectors (Plaid) — BoA + Chase
 
-Establishes read access to BoA (credit cards / deposits) via [Plaid Link](https://plaid.com).  
+Establishes read access to **Bank of America** and **Chase** (credit cards / deposits) via [Plaid Link](https://plaid.com).  
 **Does not** write bank transactions into DynamoDB ledger `TXN#` rows yet.
 
 1. Create a Plaid account → Dashboard API keys.
-2. Register redirect URI `https://finance.i-liquid.be/connectors` for OAuth (BoA).
+2. Register OAuth redirect URIs:
+   - `https://finance.i-liquid.be/connectors`
+   - `https://finance.i-liquid.be/connectors?bank=boa`
+   - `https://finance.i-liquid.be/connectors?bank=chase`
 3. Put credentials in Secrets Manager:
 
 ```bash
@@ -76,8 +80,10 @@ aws secretsmanager create-secret --name R2Finance/plaid --secret-string '{
 # env: sandbox | development | production
 ```
 
-4. On the website: **Connectors → Connect Bank of America**.
-5. Connected item token is stored at `R2Finance/connectors/boa` (not in the browser).
+4. On the website: **Connectors → Connect Bank of America / Connect Chase**.
+5. Item tokens:
+   - BoA → `R2Finance/connectors/boa`
+   - Chase → `R2Finance/connectors/chase`
 
 ## Deploy
 

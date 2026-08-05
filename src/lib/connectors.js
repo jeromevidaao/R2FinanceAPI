@@ -15,22 +15,57 @@ const secrets = require('./secrets');
 const plaid = require('./plaid');
 const {
   boaItemSecretId,
+  chaseItemSecretId,
   ledgerPlanId,
 } = require('./config');
 
-const CONNECTOR_SK = 'CONNECTOR#BOA';
+/** Supported bank connectors (access-only). */
+const BANKS = {
+  boa: {
+    id: 'boa',
+    name: 'Bank of America',
+    institutionId: plaid.BOA_INSTITUTION_ID,
+    sk: 'CONNECTOR#BOA',
+    secretId: boaItemSecretId,
+    short: 'BoA',
+  },
+  chase: {
+    id: 'chase',
+    name: 'Chase',
+    institutionId: plaid.CHASE_INSTITUTION_ID,
+    sk: 'CONNECTOR#CHASE',
+    secretId: chaseItemSecretId,
+    short: 'Chase',
+  },
+};
 
-function metaKey(planId = ledgerPlanId) {
-  return { pk: ddb.planPk(planId), sk: CONNECTOR_SK };
+function resolveBank(bankId) {
+  const key = String(bankId || '')
+    .trim()
+    .toLowerCase();
+  const bank = BANKS[key];
+  if (!bank) {
+    const err = new Error(
+      `Unknown connector "${bankId}". Supported: ${Object.keys(BANKS).join(', ')}`,
+    );
+    err.status = 404;
+    err.code = 'unknown_connector';
+    throw err;
+  }
+  return bank;
 }
 
-async function getMeta(planId = ledgerPlanId) {
-  return ddb.getItem(ddb.planPk(planId), CONNECTOR_SK);
+function metaKey(bank, planId = ledgerPlanId) {
+  return { pk: ddb.planPk(planId), sk: bank.sk };
 }
 
-async function getAccessToken() {
+async function getMeta(bank, planId = ledgerPlanId) {
+  return ddb.getItem(ddb.planPk(planId), bank.sk);
+}
+
+async function getAccessToken(bank) {
   try {
-    const j = await secrets.getSecretJson(boaItemSecretId, { cache: false });
+    const j = await secrets.getSecretJson(bank.secretId, { cache: false });
     return (j.access_token || j.accessToken || '').trim() || null;
   } catch (e) {
     if (e.name === 'ResourceNotFoundException') return null;
@@ -58,22 +93,24 @@ function mapAccount(a) {
 /**
  * Status for UI — never returns access_token.
  */
-async function status(planId = ledgerPlanId) {
+async function status(bankId, planId = ledgerPlanId) {
+  const bank = resolveBank(bankId);
   const configured = await plaid.isConfigured();
-  const meta = await getMeta(planId);
-  const hasToken = !!(await getAccessToken());
+  const meta = await getMeta(bank, planId);
+  const hasToken = !!(await getAccessToken(bank));
   const connected = !!(meta?.connected && hasToken);
 
   return {
+    connectorId: bank.id,
     provider: 'plaid',
-    institution: 'Bank of America',
-    institutionId: meta?.institutionId || plaid.BOA_INSTITUTION_ID,
+    institution: bank.name,
+    institutionId: meta?.institutionId || bank.institutionId,
     configured,
     connected,
     itemId: meta?.itemId || null,
     connectedAt: meta?.connectedAt || null,
     connectedBy: meta?.connectedBy || null,
-    institutionName: meta?.institutionName || 'Bank of America',
+    institutionName: meta?.institutionName || bank.name,
     accountCount: meta?.accountCount ?? null,
     accountsPreview: meta?.accountsPreview || [],
     note:
@@ -81,11 +118,20 @@ async function status(planId = ledgerPlanId) {
   };
 }
 
+async function listStatus(planId = ledgerPlanId) {
+  const connectors = [];
+  for (const id of Object.keys(BANKS)) {
+    connectors.push(await status(id, planId));
+  }
+  return { connectors };
+}
+
 /**
  * Exchange Plaid public_token → access_token; store secrets + meta.
  * Does not import transactions into DDB.
  */
-async function exchangeAndStore({ publicToken, email, metadata }) {
+async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
+  const bank = resolveBank(bankId);
   if (!publicToken) {
     const err = new Error('publicToken required');
     err.status = 400;
@@ -97,9 +143,9 @@ async function exchangeAndStore({ publicToken, email, metadata }) {
   const itemId = exchanged.item_id;
 
   let accounts = [];
-  let institutionId = metadata?.institution?.institution_id || plaid.BOA_INSTITUTION_ID;
-  let institutionName =
-    metadata?.institution?.name || 'Bank of America';
+  let institutionId =
+    metadata?.institution?.institution_id || bank.institutionId;
+  let institutionName = metadata?.institution?.name || bank.name;
 
   try {
     const acctRes = await plaid.getAccounts(accessToken);
@@ -121,14 +167,15 @@ async function exchangeAndStore({ publicToken, email, metadata }) {
   }
 
   await secrets.putSecretJson(
-    boaItemSecretId,
+    bank.secretId,
     {
       access_token: accessToken,
       item_id: itemId,
       institution_id: institutionId,
+      connector_id: bank.id,
       updatedAt: new Date().toISOString(),
     },
-    { description: 'R2Finance Bank of America Plaid item access token' },
+    { description: `R2Finance ${bank.name} Plaid item access token` },
   );
 
   const now = Date.now();
@@ -141,9 +188,9 @@ async function exchangeAndStore({ publicToken, email, metadata }) {
   }));
 
   await ddb.putItem({
-    ...metaKey(),
+    ...metaKey(bank),
     entityType: 'CONNECTOR',
-    connectorId: 'boa',
+    connectorId: bank.id,
     provider: 'plaid',
     connected: true,
     itemId,
@@ -153,7 +200,6 @@ async function exchangeAndStore({ publicToken, email, metadata }) {
     accountsPreview: preview,
     connectedAt: now,
     connectedBy: email || null,
-    // Explicit: no DDB ledger transaction import in this phase
     importTransactionsToDdb: false,
     updatedAt: now,
   });
@@ -161,6 +207,7 @@ async function exchangeAndStore({ publicToken, email, metadata }) {
   return {
     ok: true,
     connected: true,
+    connectorId: bank.id,
     itemId,
     institutionId,
     institutionName,
@@ -170,12 +217,13 @@ async function exchangeAndStore({ publicToken, email, metadata }) {
 }
 
 /**
- * Live probe of BoA accounts via Plaid (not from DDB ledger).
+ * Live probe of accounts via Plaid (not from DDB ledger).
  */
-async function probeAccounts(planId = ledgerPlanId) {
-  const accessToken = await getAccessToken();
+async function probeAccounts(bankId, planId = ledgerPlanId) {
+  const bank = resolveBank(bankId);
+  const accessToken = await getAccessToken(bank);
   if (!accessToken) {
-    const err = new Error('Bank of America not connected');
+    const err = new Error(`${bank.name} not connected`);
     err.status = 404;
     err.code = 'not_connected';
     throw err;
@@ -183,9 +231,8 @@ async function probeAccounts(planId = ledgerPlanId) {
 
   const acctRes = await plaid.getAccounts(accessToken);
   const accounts = (acctRes.accounts || []).map(mapAccount);
-  const meta = await getMeta(planId);
+  const meta = await getMeta(bank, planId);
 
-  // Refresh preview metadata only (still no TXN# writes)
   if (meta) {
     await ddb.putItem({
       ...meta,
@@ -204,7 +251,8 @@ async function probeAccounts(planId = ledgerPlanId) {
 
   return {
     ok: true,
-    institutionName: meta?.institutionName || 'Bank of America',
+    connectorId: bank.id,
+    institutionName: meta?.institutionName || bank.name,
     itemId: meta?.itemId || acctRes.item?.item_id || null,
     accounts,
     importTransactionsToDdb: false,
@@ -212,8 +260,9 @@ async function probeAccounts(planId = ledgerPlanId) {
   };
 }
 
-async function disconnect(planId = ledgerPlanId) {
-  const accessToken = await getAccessToken();
+async function disconnect(bankId, planId = ledgerPlanId) {
+  const bank = resolveBank(bankId);
+  const accessToken = await getAccessToken(bank);
   if (accessToken) {
     try {
       await plaid.removeItem(accessToken);
@@ -222,12 +271,12 @@ async function disconnect(planId = ledgerPlanId) {
     }
   }
   try {
-    await secrets.deleteSecret(boaItemSecretId);
+    await secrets.deleteSecret(bank.secretId);
   } catch (e) {
-    console.warn('delete boa item secret', e.message);
+    console.warn(`delete ${bank.id} item secret`, e.message);
   }
 
-  const existing = await getMeta(planId);
+  const existing = await getMeta(bank, planId);
   if (existing) {
     await ddb.putItem({
       ...existing,
@@ -240,20 +289,27 @@ async function disconnect(planId = ledgerPlanId) {
     });
   }
 
-  return { ok: true, connected: false };
+  return { ok: true, connected: false, connectorId: bank.id };
 }
 
-async function createLinkToken({ email }) {
-  return plaid.createBoaLinkToken({
+async function createLinkToken(bankId, { email } = {}) {
+  const bank = resolveBank(bankId);
+  return plaid.createLinkToken({
     clientUserId: email || 'r2finance',
+    institutionId: bank.institutionId,
+    bankKey: bank.id,
   });
 }
 
 module.exports = {
+  BANKS,
+  resolveBank,
   status,
+  listStatus,
   exchangeAndStore,
   probeAccounts,
   disconnect,
   createLinkToken,
-  CONNECTOR_SK,
+  CONNECTOR_SK_BOA: BANKS.boa.sk,
+  CONNECTOR_SK_CHASE: BANKS.chase.sk,
 };
