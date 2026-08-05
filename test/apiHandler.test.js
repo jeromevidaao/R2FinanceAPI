@@ -12,14 +12,14 @@ describe('R2FinanceApiHandler', () => {
     const body = JSON.parse(res.body);
     assert.equal(body.ok, true);
     assert.equal(body.service, 'R2FinanceAPI');
-    assert.equal(body.resources.table, 'R2Finance');
+    assert.equal(body.table, 'R2Finance');
   });
 
-  it('unknown path is 501 in phase 1', async () => {
+  it('unknown path is 404', async () => {
     const res = await handler({
-      rawPath: '/v1/plans',
+      rawPath: '/nope',
       requestContext: { http: { method: 'GET' } },
     });
-    assert.equal(res.statusCode, 501);
+    assert.equal(res.statusCode, 404);
   });
 });
