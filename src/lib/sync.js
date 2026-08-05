@@ -492,7 +492,146 @@ async function categorizeTransaction({ ynabTxnId, categoryYnabId, approved = tru
     gsi2pk: 'PENDING_PUSH',
     gsi2sk: `${String(now).padStart(15, '0')}#${ynabTxnId}`,
   });
-  return { ok: true, ynabTxnId, categoryYnabId };
+  return { ok: true, ynabTxnId, categoryYnabId, approved };
+}
+
+/**
+ * Approve a transaction in DDB and mark pending push to YNAB.
+ */
+async function approveTransaction({ ynabTxnId }) {
+  const planId = ledgerPlanId;
+  const sk = `TXN#${ynabTxnId}`;
+  const existing = await ddb.getItem(ddb.planPk(planId), sk);
+  if (!existing) throw new Error(`transaction ${ynabTxnId} not in DDB — pull first`);
+  const payload = {
+    ...(existing.payload || {}),
+    approved: true,
+  };
+  const now = Date.now();
+  await ddb.putItem({
+    ...existing,
+    approved: true,
+    payload,
+    syncStatus: 'PENDING_PUSH',
+    updatedAt: now,
+    gsi2pk: 'PENDING_PUSH',
+    gsi2sk: `${String(now).padStart(15, '0')}#${ynabTxnId}`,
+  });
+  return { ok: true, ynabTxnId, approved: true };
+}
+
+/**
+ * Map a DDB transaction row to the public API shape.
+ */
+function mapTxn(t) {
+  const p = t.payload || {};
+  return {
+    ynabId: t.ynabId,
+    accountId: t.accountId || p.account_id,
+    date: t.date || p.date,
+    amount: t.amount ?? p.amount,
+    payeeId: t.payeeId ?? p.payee_id ?? null,
+    categoryId: t.categoryId ?? p.category_id ?? null,
+    memo: t.memo ?? p.memo ?? null,
+    cleared: t.cleared || p.cleared || 'uncleared',
+    approved: t.approved ?? p.approved ?? true,
+    flagColor: p.flag_color || null,
+    transferAccountId: p.transfer_account_id || null,
+    transferTransactionId: p.transfer_transaction_id || null,
+    importId: p.import_id || null,
+    subtransactions: (p.subtransactions || []).map((s) => ({
+      ynabId: s.id,
+      amount: s.amount,
+      payeeId: s.payee_id || null,
+      categoryId: s.category_id || null,
+      memo: s.memo || null,
+    })),
+  };
+}
+
+/**
+ * Needs-attention inbox (YNAB-style):
+ * - unapproved (any account / including transfers)
+ * - on-budget, no category, not a transfer, no subtransactions
+ * - on-budget, category is Internal "Uncategorized"
+ */
+async function listInbox() {
+  const planId = ledgerPlanId;
+  const [txns, accounts, categories, payees] = await Promise.all([
+    ddb.queryPk(ddb.planPk(planId), 'TXN#'),
+    ddb.queryPk(ddb.planPk(planId), 'ACCT#'),
+    ddb.queryPk(ddb.planPk(planId), 'CAT#'),
+    ddb.queryPk(ddb.planPk(planId), 'PAYEE#'),
+  ]);
+
+  const acctById = new Map();
+  for (const a of accounts) {
+    if (a.deleted || a.closed) continue;
+    const id = a.ynabId || String(a.sk || '').replace(/^ACCT#/, '');
+    acctById.set(id, a);
+  }
+
+  const uncategorizedIds = new Set();
+  for (const c of categories) {
+    if (c.deleted) continue;
+    const name = (c.name || c.payload?.name || '').toLowerCase();
+    if (name === 'uncategorized') {
+      const id = c.ynabId || String(c.sk || '').replace(/^CAT#/, '');
+      uncategorizedIds.add(id);
+    }
+  }
+
+  const payeeById = new Map();
+  for (const p of payees) {
+    if (p.deleted) continue;
+    const id = p.ynabId || String(p.sk || '').replace(/^PAYEE#/, '');
+    payeeById.set(id, p);
+  }
+
+  const out = [];
+  for (const raw of txns) {
+    if (raw.deleted) continue;
+    const t = mapTxn(raw);
+    if (!t.ynabId || !t.accountId) continue;
+    const acct = acctById.get(t.accountId);
+    if (!acct) continue;
+
+    const onBudget = acct.onBudget ?? acct.payload?.on_budget ?? true;
+    const isTransfer = !!t.transferAccountId;
+    const hasSubs = (t.subtransactions || []).length > 0;
+    const approved = t.approved !== false;
+    const catNull = t.categoryId == null || t.categoryId === '';
+    const catUncategorized = t.categoryId && uncategorizedIds.has(t.categoryId);
+
+    let reason = null;
+    if (!approved) {
+      reason = 'unapproved';
+    } else if (onBudget && !isTransfer && !hasSubs && (catNull || catUncategorized)) {
+      reason = 'uncategorized';
+    }
+    if (!reason) continue;
+
+    const payee = t.payeeId ? payeeById.get(t.payeeId) : null;
+    out.push({
+      ...t,
+      accountName: acct.name || acct.payload?.name || null,
+      payeeName: payee?.name || payee?.payload?.name || null,
+      reason,
+      onBudget: !!onBudget,
+    });
+  }
+
+  out.sort((a, b) => {
+    if (a.date === b.date) return (b.amount || 0) - (a.amount || 0);
+    return a.date < b.date ? 1 : -1;
+  });
+
+  return {
+    count: out.length,
+    unapproved: out.filter((t) => t.reason === 'unapproved').length,
+    uncategorized: out.filter((t) => t.reason === 'uncategorized').length,
+    transactions: out,
+  };
 }
 
 async function stats() {
@@ -504,12 +643,24 @@ async function stats() {
   }
   const meta = all.find((i) => i.sk === 'META');
   const cursor = all.find((i) => i.sk === 'CURSOR#ynab');
+  let inbox = null;
+  try {
+    const ib = await listInbox();
+    inbox = {
+      count: ib.count,
+      unapproved: ib.unapproved,
+      uncategorized: ib.uncategorized,
+    };
+  } catch (e) {
+    inbox = { error: e.message };
+  }
   return {
     itemCount: all.length,
     byType,
     planName: meta?.payload?.name,
     ynabPlanId: meta?.ynabPlanId || meta?.payload?.ynabPlanId,
     serverKnowledge: cursor?.serverKnowledge ?? meta?.serverKnowledge,
+    inbox,
   };
 }
 
@@ -518,6 +669,9 @@ module.exports = {
   deltaPull,
   pushPending,
   categorizeTransaction,
+  approveTransaction,
+  listInbox,
+  mapTxn,
   stats,
   uuid,
 };

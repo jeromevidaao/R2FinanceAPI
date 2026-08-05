@@ -140,6 +140,23 @@ exports.handler = async (event) => {
       return json(200, { marked, push });
     }
 
+    if (method === 'POST' && path === '/v1/transactions/approve') {
+      const body = parseBody(event);
+      if (!body.ynabTxnId) {
+        return json(400, { error: 'ynabTxnId required' });
+      }
+      const marked = await sync.approveTransaction(body);
+      let push;
+      if (body.push !== false) {
+        push = await sync.pushPending({ limit: 5 });
+      }
+      return json(200, { marked, push });
+    }
+
+    if (method === 'GET' && path === '/v1/inbox') {
+      return json(200, await sync.listInbox());
+    }
+
     if (method === 'GET' && path === '/v1/accounts') {
       const items = await ddb.queryPk(ddb.planPk(), 'ACCT#');
       return json(200, {
@@ -195,37 +212,11 @@ exports.handler = async (event) => {
 
     if (method === 'GET' && path === '/v1/transactions') {
       const items = await ddb.queryPk(ddb.planPk(), 'TXN#');
-      const qs = event?.queryStringParameters || {};
-      const openOnly = qs.open_accounts !== '0';
       // Map closed accounts if needed — return all non-deleted for hydrate
       return json(200, {
         transactions: items
           .filter((t) => !t.deleted)
-          .map((t) => {
-            const p = t.payload || {};
-            return {
-              ynabId: t.ynabId,
-              accountId: t.accountId || p.account_id,
-              date: t.date || p.date,
-              amount: t.amount ?? p.amount,
-              payeeId: t.payeeId ?? p.payee_id ?? null,
-              categoryId: t.categoryId ?? p.category_id ?? null,
-              memo: t.memo ?? p.memo ?? null,
-              cleared: t.cleared || p.cleared || 'uncleared',
-              approved: t.approved ?? p.approved ?? true,
-              flagColor: p.flag_color || null,
-              transferAccountId: p.transfer_account_id || null,
-              transferTransactionId: p.transfer_transaction_id || null,
-              importId: p.import_id || null,
-              subtransactions: (p.subtransactions || []).map((s) => ({
-                ynabId: s.id,
-                amount: s.amount,
-                payeeId: s.payee_id || null,
-                categoryId: s.category_id || null,
-                memo: s.memo || null,
-              })),
-            };
-          }),
+          .map((t) => sync.mapTxn(t)),
       });
     }
 

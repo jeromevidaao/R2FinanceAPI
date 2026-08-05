@@ -30,11 +30,13 @@ AWS backend for **R2Finance** — DynamoDB ledger + YNAB bidirectional sync.
 | GET | `/v1/stats` | Counts by entity type |
 | GET | `/v1/accounts` | Accounts from DDB |
 | GET | `/v1/categories` | Categories from DDB |
+| GET | `/v1/inbox` | Unapproved + uncategorized (YNAB-style needs-attention) |
 | POST | `/v1/sync/import` | Full import |
 | POST | `/v1/sync/pull` | Delta pull |
 | POST | `/v1/sync/push` | Push pending |
 | POST | `/v1/sync/tick` | Pull then push |
-| POST | `/v1/transactions/categorize` | Local categorize → push |
+| POST | `/v1/transactions/categorize` | Categorize in DDB → push YNAB |
+| POST | `/v1/transactions/approve` | Approve in DDB → push YNAB |
 
 ## Deploy
 
