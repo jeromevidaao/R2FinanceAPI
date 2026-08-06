@@ -654,6 +654,7 @@ function mapTxn(t) {
       payeeId: s.payee_id || null,
       categoryId: s.category_id || null,
       memo: s.memo || null,
+      transferAccountId: s.transfer_account_id || null,
     })),
   };
 }
