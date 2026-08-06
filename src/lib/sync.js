@@ -900,15 +900,17 @@ async function devicePush(body = {}) {
 
 /**
  * Needs-attention inbox (YNAB-style Spending):
- * Unapproved only — approve works without a category and removes the row.
- * Uncategorized-but-approved stays off this list (fixable later in register).
+ * - unapproved (always, including transfers)
+ * - on-budget uncategorized (no transfer, no splits)
+ * Approve without a category removes unapproved rows; uncategorized-approved stay until categorized.
  */
 async function listInbox() {
   const planId = ledgerPlanId;
-  const [txns, accounts, payees] = await Promise.all([
+  const [txns, accounts, payees, categories] = await Promise.all([
     ddb.queryPk(ddb.planPk(planId), 'TXN#'),
     ddb.queryPk(ddb.planPk(planId), 'ACCT#'),
     ddb.queryPk(ddb.planPk(planId), 'PAYEE#'),
+    ddb.queryPk(ddb.planPk(planId), 'CAT#'),
   ]);
 
   const acctById = new Map();
@@ -925,7 +927,19 @@ async function listInbox() {
     payeeById.set(id, p);
   }
 
+  const uncategorizedIds = new Set();
+  for (const c of categories) {
+    if (c.deleted) continue;
+    const name = (c.name || c.payload?.name || '').toLowerCase();
+    if (name === 'uncategorized') {
+      const id = c.ynabId || String(c.sk || '').replace(/^CAT#/, '');
+      if (id) uncategorizedIds.add(id);
+    }
+  }
+
   const out = [];
+  let unapproved = 0;
+  let uncategorized = 0;
   for (const raw of txns) {
     if (raw.deleted) continue;
     const t = mapTxn(raw);
@@ -934,15 +948,25 @@ async function listInbox() {
     if (!acct) continue;
 
     const approved = t.approved !== false;
-    if (approved) continue;
-
     const onBudget = !!(acct.onBudget ?? acct.payload?.on_budget ?? true);
+    const isTransfer = !!t.transferAccountId;
+    const hasSubs = Array.isArray(t.subtransactions) && t.subtransactions.length > 0;
+    const catMissing = !t.categoryId || uncategorizedIds.has(t.categoryId);
+    const isUncategorized =
+      approved && onBudget && !isTransfer && !hasSubs && catMissing;
+
+    if (approved && !isUncategorized) continue;
+
+    const reason = !approved ? 'unapproved' : 'uncategorized';
+    if (!approved) unapproved += 1;
+    else uncategorized += 1;
+
     const payee = t.payeeId ? payeeById.get(t.payeeId) : null;
     out.push({
       ...t,
       accountName: acct.name || acct.payload?.name || null,
       payeeName: payee?.name || payee?.payload?.name || null,
-      reason: 'unapproved',
+      reason,
       onBudget,
     });
   }
@@ -954,8 +978,8 @@ async function listInbox() {
 
   return {
     count: out.length,
-    unapproved: out.length,
-    uncategorized: 0,
+    unapproved,
+    uncategorized,
     transactions: out,
   };
 }
