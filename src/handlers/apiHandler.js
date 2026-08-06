@@ -351,8 +351,29 @@ exports.handler = async (event) => {
     }
 
     if (method === 'GET' && path === '/v1/categories') {
+      const { colorForCategory } = require('../lib/categoryColors');
       const groups = await ddb.queryPk(ddb.planPk(), 'CGRP#');
       const cats = await ddb.queryPk(ddb.planPk(), 'CAT#');
+      const backfill = [];
+      const categories = cats
+        .filter((c) => !c.deleted)
+        .map((c) => {
+          let color = c.color;
+          if (!color) {
+            color = colorForCategory({ name: c.name, ynabId: c.ynabId });
+            backfill.push({ ...c, color, updatedAt: Date.now() });
+          }
+          return {
+            ynabId: c.ynabId,
+            name: c.name,
+            categoryGroupId: c.categoryGroupId,
+            hidden: c.hidden ?? false,
+            color,
+          };
+        });
+      if (backfill.length) {
+        await ddb.batchWrite(backfill);
+      }
       return respond(200, {
         groups: groups
           .filter((g) => !g.deleted)
@@ -361,14 +382,7 @@ exports.handler = async (event) => {
             name: g.name,
             hidden: g.hidden ?? false,
           })),
-        categories: cats
-          .filter((c) => !c.deleted)
-          .map((c) => ({
-            ynabId: c.ynabId,
-            name: c.name,
-            categoryGroupId: c.categoryGroupId,
-            hidden: c.hidden ?? false,
-          })),
+        categories,
       });
     }
 

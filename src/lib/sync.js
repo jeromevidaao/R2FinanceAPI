@@ -4,6 +4,32 @@ const crypto = require('crypto');
 const ynab = require('./ynab');
 const ddb = require('./ddb');
 const { ledgerPlanId } = require('./config');
+const { colorForCategory } = require('./categoryColors');
+
+/** Load existing category colors so re-import / delta never drifts user or assigned colors. */
+async function loadCategoryColorMap(planId) {
+  const cats = await ddb.queryPk(ddb.planPk(planId), 'CAT#');
+  const map = new Map();
+  for (const c of cats) {
+    if (c.ynabId && c.color) map.set(c.ynabId, c.color);
+  }
+  return map;
+}
+
+function categoryColorExtra(c, groupId, colorMap) {
+  const color = colorForCategory({
+    name: c.name,
+    ynabId: c.id,
+    existingColor: colorMap.get(c.id),
+  });
+  return {
+    name: c.name,
+    categoryGroupId: c.category_group_id || groupId,
+    hidden: c.hidden,
+    deleted: !!c.deleted,
+    color,
+  };
+}
 
 function uuid() {
   return crypto.randomUUID();
@@ -116,6 +142,8 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
     );
   }
 
+  const categoryColorMap = await loadCategoryColorMap(planId);
+
   for (const g of categoriesR.categoryGroups) {
     if (g.deleted) continue;
     items.push(
@@ -137,11 +165,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
           entityType: 'category',
           ynabId: c.id,
           payload: c,
-          extra: {
-            name: c.name,
-            categoryGroupId: c.category_group_id || g.id,
-            hidden: c.hidden,
-          },
+          extra: categoryColorExtra(c, g.id, categoryColorMap),
         }),
       );
     }
@@ -275,6 +299,7 @@ async function deltaPull() {
 
   const categoriesR = await ynab.listCategories(ynabPlanId, last);
   knowledge = Math.max(knowledge, categoriesR.serverKnowledge);
+  const categoryColorMap = await loadCategoryColorMap(planId);
   for (const g of categoriesR.categoryGroups) {
     items.push(
       entityItem({
@@ -294,12 +319,7 @@ async function deltaPull() {
           entityType: 'category',
           ynabId: c.id,
           payload: c,
-          extra: {
-            name: c.name,
-            categoryGroupId: c.category_group_id || g.id,
-            hidden: c.hidden,
-            deleted: !!c.deleted,
-          },
+          extra: categoryColorExtra(c, g.id, categoryColorMap),
         }),
       );
     }
