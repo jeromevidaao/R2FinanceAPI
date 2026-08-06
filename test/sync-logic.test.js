@@ -78,3 +78,77 @@ describe('device/push route exists', () => {
     assert.notEqual(res.statusCode, 404);
   });
 });
+
+describe('matchedCounterpartTombstones', () => {
+  const {
+    matchedCounterpartTombstones,
+    tombstoneTxnItem,
+  } = require('../src/lib/sync');
+
+  it('tombstones matched import counterpart when survivor is live', () => {
+    const importId = 'import-gone-1';
+    const survivorId = 'survivor-1';
+    const items = matchedCounterpartTombstones('default', [
+      {
+        id: survivorId,
+        matched_transaction_id: importId,
+        account_id: 'acct-1',
+        deleted: false,
+      },
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].sk, `TXN#${importId}`);
+    assert.equal(items[0].deleted, true);
+    assert.equal(items[0].ynabId, importId);
+  });
+
+  it('does not tombstone when counterpart is still live in the same batch', () => {
+    const items = matchedCounterpartTombstones('default', [
+      {
+        id: 'a',
+        matched_transaction_id: 'b',
+        account_id: 'acct',
+        deleted: false,
+      },
+      {
+        id: 'b',
+        matched_transaction_id: 'a',
+        account_id: 'acct',
+        deleted: false,
+      },
+    ]);
+    assert.equal(items.length, 0);
+  });
+
+  it('skips pending-push counterpart keys', () => {
+    const pending = new Set(['TXN#import-1']);
+    const items = matchedCounterpartTombstones(
+      'default',
+      [
+        {
+          id: 'surv',
+          matched_transaction_id: 'import-1',
+          account_id: 'a',
+          deleted: false,
+        },
+      ],
+      pending,
+    );
+    assert.equal(items.length, 0);
+  });
+
+  it('dedupes the same matched id from multiple rows', () => {
+    const items = matchedCounterpartTombstones('default', [
+      { id: 's1', matched_transaction_id: 'gone', account_id: 'a' },
+      { id: 's2', matched_transaction_id: 'gone', account_id: 'a' },
+    ]);
+    assert.equal(items.length, 1);
+  });
+
+  it('tombstoneTxnItem marks deleted + approved', () => {
+    const item = tombstoneTxnItem('default', 'x', 'acct');
+    assert.equal(item.deleted, true);
+    assert.equal(item.approved, true);
+    assert.equal(item.sk, 'TXN#x');
+  });
+});

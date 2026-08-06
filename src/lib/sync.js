@@ -63,6 +63,83 @@ function entityItem({
 }
 
 /**
+ * Soft-delete a YNAB transaction row in DDB (match counterpart or true delete).
+ * When YNAB matches an import to a user/transfer txn, the import id vanishes
+ * from the live list (404) while the survivor keeps matched_transaction_id.
+ * Without this tombstone, inbox double-counts both sides.
+ */
+function tombstoneTxnItem(planId, ynabId, accountId) {
+  if (!ynabId) return null;
+  return entityItem({
+    planId,
+    sk: `TXN#${ynabId}`,
+    entityType: 'transaction',
+    ynabId,
+    payload: {
+      id: ynabId,
+      deleted: true,
+      account_id: accountId || null,
+      _tombstone: 'matched_or_missing',
+    },
+    extra: {
+      deleted: true,
+      approved: true,
+      accountId: accountId || undefined,
+    },
+  });
+}
+
+/**
+ * For each YNAB txn that references a match, tombstone the counterpart id.
+ * Empirically when matched_transaction_id is set, the other side is never
+ * both-live in YNAB's transaction list (it was absorbed/deleted).
+ *
+ * @param {string} planId
+ * @param {Array<{id:string, matched_transaction_id?:string|null, account_id?:string, deleted?:boolean}>} transactions
+ * @param {Set<string>} [pendingSk] TXN#… keys to leave alone (local PENDING_PUSH)
+ * @returns {object[]} DDB put items
+ */
+function matchedCounterpartTombstones(planId, transactions, pendingSk = new Set()) {
+  const out = [];
+  const seen = new Set();
+  for (const t of transactions || []) {
+    if (!t || t.deleted) continue;
+    const mid = t.matched_transaction_id;
+    if (!mid || mid === t.id) continue;
+    const sk = `TXN#${mid}`;
+    if (pendingSk.has(sk) || seen.has(mid)) continue;
+    // Never tombstone a counterpart that is itself present as a live row in
+    // this same batch (defensive — YNAB currently never does this).
+    const stillLive = (transactions || []).some(
+      (o) => o && o.id === mid && !o.deleted,
+    );
+    if (stillLive) continue;
+    seen.add(mid);
+    const item = tombstoneTxnItem(planId, mid, t.account_id);
+    if (item) out.push(item);
+  }
+  return out;
+}
+
+/**
+ * After a full YNAB snapshot, mark DDB TXN rows whose ynabId is no longer
+ * in the live YNAB set as deleted. Skips PENDING_PUSH (device-originated).
+ */
+async function reconcileMissingYnabTxns(planId, liveYnabIds) {
+  const existing = await ddb.queryPk(ddb.planPk(planId), 'TXN#');
+  const items = [];
+  for (const row of existing) {
+    if (row.deleted) continue;
+    if (row.syncStatus === 'PENDING_PUSH') continue;
+    const id = row.ynabId || String(row.sk || '').replace(/^TXN#/, '');
+    if (!id || liveYnabIds.has(id)) continue;
+    items.push(tombstoneTxnItem(planId, id, row.accountId || row.payload?.account_id));
+  }
+  if (items.length) await ddb.batchWrite(items);
+  return items.length;
+}
+
+/**
  * Full import (or re-import) of one YNAB plan into DynamoDB.
  */
 async function fullImport({ sinceDate = '1990-01-01' } = {}) {
@@ -224,6 +301,9 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
     );
   }
 
+  // Matched imports: survivor stays; counterpart id is gone from YNAB — tombstone it.
+  items.push(...matchedCounterpartTombstones(planId, txnsR.transactions));
+
   for (const s of schedR.scheduled) {
     if (s.deleted) continue;
     items.push(
@@ -238,6 +318,13 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
   }
 
   await ddb.batchWrite(items);
+
+  // Safety net: any leftover DDB TXN with a ynabId not in this snapshot (e.g.
+  // matched imports missed by delta) → soft-delete so inbox matches YNAB.
+  const liveIds = new Set(
+    txnsR.transactions.filter((t) => t && !t.deleted).map((t) => t.id),
+  );
+  const orphanedTombstoned = await reconcileMissingYnabTxns(planId, liveIds);
 
   return {
     planName: ynabPlan.name,
@@ -254,6 +341,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
       transactions: txnsR.transactions.filter((t) => !t.deleted).length,
       scheduled: schedR.scheduled.filter((s) => !s.deleted).length,
       itemsWritten: items.length,
+      orphanedTombstoned,
     },
     serverKnowledge: knowledge,
   };
@@ -390,6 +478,13 @@ async function deltaPull() {
       }),
     );
   }
+
+  // When YNAB matches import ↔ manual/transfer, the import id disappears but
+  // may never show up as deleted:true in a missed delta window. Tombstone the
+  // counterpart referenced by matched_transaction_id so inbox stays aligned.
+  items.push(
+    ...matchedCounterpartTombstones(planId, txnsR.transactions, pendingSk),
+  );
 
   const schedR = await ynab.listScheduled(ynabPlanId, last);
   knowledge = Math.max(knowledge, schedR.serverKnowledge);
@@ -906,4 +1001,7 @@ module.exports = {
   mapTxn,
   stats,
   uuid,
+  tombstoneTxnItem,
+  matchedCounterpartTombstones,
+  reconcileMissingYnabTxns,
 };
