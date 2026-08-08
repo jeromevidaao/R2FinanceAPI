@@ -210,18 +210,48 @@ describe('matchedCounterpartTombstones', () => {
     assert.equal(items[0].ynabId, importId);
   });
 
-  it('does not tombstone when counterpart is still live in the same batch', () => {
+  it('hides still-live non-transfer bank import matched to a transfer (YNAB triple bug)', () => {
+    const items = matchedCounterpartTombstones('default', [
+      {
+        id: 'xfer',
+        matched_transaction_id: 'import-ghost',
+        account_id: 'acct',
+        transfer_account_id: 'other-acct',
+        amount: -711820,
+        approved: true,
+        deleted: false,
+      },
+      {
+        id: 'import-ghost',
+        account_id: 'acct',
+        amount: -711820,
+        approved: false,
+        category_id: null,
+        deleted: false,
+      },
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].sk, 'TXN#import-ghost');
+    assert.equal(items[0].deleted, true);
+    assert.equal(items[0].approved, true);
+    assert.equal(items[0].syncStatus, 'PENDING_PUSH');
+    assert.equal(items[0].payload._tombstone, 'ghost_transfer_import');
+  });
+
+  it('does not hide a still-live transfer matched to another transfer', () => {
     const items = matchedCounterpartTombstones('default', [
       {
         id: 'a',
         matched_transaction_id: 'b',
         account_id: 'acct',
+        transfer_account_id: 'x',
         deleted: false,
       },
       {
         id: 'b',
         matched_transaction_id: 'a',
         account_id: 'acct',
+        transfer_account_id: 'y',
         deleted: false,
       },
     ]);
@@ -437,6 +467,35 @@ describe('ghostTransferImportTombstones', () => {
     assert.equal(dateDiffDays('2026-08-07', '2026-08-08'), 1);
     assert.equal(dateDiffDays('2026-08-07', '2026-08-07'), 0);
     assert.equal(dateDiffDays(null, '2026-08-07'), Infinity);
+  });
+
+  it('autoApproveUnapprovedTransferLegs approves unapproved side of a pair', () => {
+    const { autoApproveUnapprovedTransferLegs } = require('../src/lib/sync');
+    const items = autoApproveUnapprovedTransferLegs('default', [
+      {
+        id: 'in',
+        account_id: freedom,
+        date: '2026-07-15',
+        amount: 1134530,
+        approved: false,
+        transfer_account_id: checkin,
+        transfer_transaction_id: 'out',
+      },
+      {
+        id: 'out',
+        account_id: checkin,
+        date: '2026-07-15',
+        amount: -1134530,
+        approved: true,
+        transfer_account_id: freedom,
+        transfer_transaction_id: 'in',
+      },
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].ynabId, 'in');
+    assert.equal(items[0].approved, true);
+    assert.equal(items[0].syncStatus, 'PENDING_PUSH');
+    assert.equal(items[0].deleted, false);
   });
 
   it('mergeLedgerForGhostScan overlays delta on DDB so ghosts outside delta are found', () => {

@@ -150,32 +150,152 @@ function tombstoneTxnItem(planId, ynabId, accountId, reason = 'matched_or_missin
 
 /**
  * For each YNAB txn that references a match, tombstone the counterpart id.
- * Empirically when matched_transaction_id is set, the other side is never
- * both-live in YNAB's transaction list (it was absorbed/deleted).
+ *
+ * Normal case: matched import id is gone from YNAB (404) → soft-delete in DDB.
+ * YNAB bug case: both the transfer AND the bank-import stay live with
+ * matched_transaction_id set → hide the non-transfer import (Category Needed
+ * third row) and auto-approve it if still unapproved.
  *
  * @param {string} planId
- * @param {Array<{id:string, matched_transaction_id?:string|null, account_id?:string, deleted?:boolean}>} transactions
+ * @param {Array<{id:string, matched_transaction_id?:string|null, account_id?:string, deleted?:boolean, transfer_account_id?:string|null, approved?:boolean, amount?:number, date?:string}>} transactions
  * @param {Set<string>} [pendingSk] TXN#… keys to leave alone (local PENDING_PUSH)
  * @returns {object[]} DDB put items
  */
 function matchedCounterpartTombstones(planId, transactions, pendingSk = new Set()) {
   const out = [];
   const seen = new Set();
-  for (const t of transactions || []) {
-    if (!t || t.deleted) continue;
+  const live = (transactions || []).filter((t) => t && t.id && !t.deleted);
+  const byId = new Map(live.map((t) => [t.id, t]));
+
+  for (const t of live) {
     const mid = t.matched_transaction_id;
     if (!mid || mid === t.id) continue;
     const sk = `TXN#${mid}`;
     if (pendingSk.has(sk) || seen.has(mid)) continue;
-    // Never tombstone a counterpart that is itself present as a live row in
-    // this same batch (defensive — YNAB currently never does this).
-    const stillLive = (transactions || []).some(
-      (o) => o && o.id === mid && !o.deleted,
-    );
-    if (stillLive) continue;
+
+    const other = byId.get(mid);
+    if (other) {
+      // Both live — only hide a non-transfer bank import (the classic YNAB
+      // "Category Needed" third row next to a real transfer pair).
+      if (other.transfer_account_id) continue;
+      seen.add(mid);
+      const item = ghostTombstoneFromYnab(planId, other, t.id);
+      if (item) out.push(item);
+      continue;
+    }
+
+    // Counterpart gone from YNAB live list — standard match absorb.
     seen.add(mid);
     const item = tombstoneTxnItem(planId, mid, t.account_id);
     if (item) out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Soft-delete + auto-approve a YNAB-shaped ghost import row.
+ * Used by matched-live and amount-based ghost detectors.
+ */
+function ghostTombstoneFromYnab(planId, g, ghostOfTransferId) {
+  if (!g || !g.id) return null;
+  const item = tombstoneTxnItem(
+    planId,
+    g.id,
+    g.account_id || null,
+    'ghost_transfer_import',
+  );
+  if (!item) return null;
+  item.date = g.date;
+  item.amount = g.amount;
+  item.payload = {
+    ...item.payload,
+    date: g.date,
+    amount: g.amount,
+    payee_id: g.payee_id ?? null,
+    category_id: g.category_id ?? null,
+    import_id: g.import_id ?? null,
+    approved: true,
+    cleared: g.cleared || 'uncleared',
+    memo: g.memo ?? null,
+    payee_name: g.payee_name ?? null,
+    import_payee_name: g.import_payee_name ?? null,
+    _ghost_of_transfer_id: ghostOfTransferId || null,
+  };
+  if (g.approved === false) {
+    const now = item.updatedAt || Date.now();
+    const sk = `TXN#${g.id}`;
+    item.syncStatus = 'PENDING_PUSH';
+    item.gsi2pk = 'PENDING_PUSH';
+    item.gsi2sk = `${String(now).padStart(15, '0')}#${sk}`;
+  }
+  return item;
+}
+
+/**
+ * Auto-approve unapproved transfer legs when their linked counterpart exists.
+ * YNAB often leaves one side of a transfer pair as "Needs approval" while the
+ * other is already Approved — R2Finance treats the pair as complete.
+ *
+ * @param {string} planId
+ * @param {Array<object>} transactions YNAB-shaped (full ledger merge ok)
+ * @param {Set<string>} [pendingSk]
+ * @param {Set<string>} [skipIds] already handled as ghosts
+ * @returns {object[]} DDB put items marked PENDING_PUSH approved
+ */
+function autoApproveUnapprovedTransferLegs(
+  planId,
+  transactions,
+  pendingSk = new Set(),
+  skipIds = new Set(),
+) {
+  const live = (transactions || []).filter((t) => t && t.id && !t.deleted);
+  const byId = new Map(live.map((t) => [t.id, t]));
+  const out = [];
+  const seen = new Set();
+
+  for (const t of live) {
+    if (!t.transfer_account_id) continue;
+    if (t.approved !== false) continue;
+    if (skipIds.has(t.id) || seen.has(t.id)) continue;
+    const sk = `TXN#${t.id}`;
+    if (pendingSk.has(sk)) continue;
+
+    // Prefer linked pair; also approve lone transfers (no category needed).
+    if (t.transfer_transaction_id) {
+      const other = byId.get(t.transfer_transaction_id);
+      if (!other || other.deleted) continue;
+      if (other.amount !== -t.amount) continue;
+    }
+
+    seen.add(t.id);
+    const now = Date.now();
+    const payload = {
+      ...t,
+      approved: true,
+    };
+    out.push(
+      entityItem({
+        planId,
+        sk,
+        entityType: 'transaction',
+        ynabId: t.id,
+        payload,
+        syncStatus: 'PENDING_PUSH',
+        extra: {
+          accountId: t.account_id,
+          date: t.date,
+          amount: t.amount,
+          payeeId: t.payee_id,
+          categoryId: t.category_id,
+          approved: true,
+          cleared: t.cleared,
+          memo: t.memo,
+          deleted: false,
+          gsi2pk: 'PENDING_PUSH',
+          gsi2sk: `${String(now).padStart(15, '0')}#${sk}`,
+        },
+      }),
+    );
   }
   return out;
 }
@@ -297,39 +417,8 @@ function ghostTransferImportTombstones(planId, transactions, pendingSk = new Set
       const sk = `TXN#${g.id}`;
       if (pendingSk.has(sk)) continue;
       seen.add(g.id);
-
-      const item = tombstoneTxnItem(
-        planId,
-        g.id,
-        g.account_id || tr.account_id,
-        'ghost_transfer_import',
-      );
-      if (!item) continue;
-      // Preserve identity fields so clients/debugging can see what we hid.
-      item.date = g.date;
-      item.amount = g.amount;
-      item.payload = {
-        ...item.payload,
-        date: g.date,
-        amount: g.amount,
-        payee_id: g.payee_id ?? null,
-        category_id: g.category_id ?? null,
-        import_id: g.import_id ?? null,
-        approved: true,
-        cleared: g.cleared || 'uncleared',
-        memo: g.memo ?? null,
-        payee_name: g.payee_name ?? null,
-        import_payee_name: g.import_payee_name ?? null,
-        _ghost_of_transfer_id: tr.id,
-      };
-      // Auto-approve in YNAB when the ghost still needs approval.
-      if (g.approved === false) {
-        const now = item.updatedAt || Date.now();
-        item.syncStatus = 'PENDING_PUSH';
-        item.gsi2pk = 'PENDING_PUSH';
-        item.gsi2sk = `${String(now).padStart(15, '0')}#${sk}`;
-      }
-      out.push(item);
+      const item = ghostTombstoneFromYnab(planId, g, tr.id);
+      if (item) out.push(item);
     }
   }
   return out;
@@ -528,9 +617,25 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
   }
 
   // Matched imports: survivor stays; counterpart id is gone from YNAB — tombstone it.
-  items.push(...matchedCounterpartTombstones(planId, txnsR.transactions));
+  // Also hides still-live matched bank imports (YNAB triple-row bug).
+  const matchedItems = matchedCounterpartTombstones(planId, txnsR.transactions);
+  const matchedHideIds = new Set(
+    matchedItems.map((i) => i.ynabId).filter(Boolean),
+  );
+  items.push(...matchedItems);
   // Ghost transfer imports: soft-delete + auto-approve (see ghostTransferImportTombstones).
-  items.push(...ghostItems);
+  // Skip ids already hidden via matched_transaction_id (avoid double BatchWrite key).
+  items.push(...ghostItems.filter((i) => !matchedHideIds.has(i.ynabId)));
+  const hideIds = new Set([...ghostIds, ...matchedHideIds]);
+  // One transfer leg often stays "Needs approval" — auto-approve for consistency.
+  items.push(
+    ...autoApproveUnapprovedTransferLegs(
+      planId,
+      txnsR.transactions,
+      new Set(),
+      hideIds,
+    ),
+  );
 
   for (const s of schedR.scheduled) {
     if (s.deleted) continue;
@@ -741,13 +846,30 @@ async function deltaPull() {
   // When YNAB matches import ↔ manual/transfer, the import id disappears but
   // may never show up as deleted:true in a missed delta window. Tombstone the
   // counterpart referenced by matched_transaction_id so inbox stays aligned.
-  items.push(
-    ...matchedCounterpartTombstones(planId, txnsR.transactions, pendingSk),
+  // Also hides still-live matched bank imports (YNAB triple-row bug).
+  const matchedItems = matchedCounterpartTombstones(
+    planId,
+    ghostScan,
+    pendingSk,
   );
+  const matchedHideIds = new Set(
+    matchedItems.map((i) => i.ynabId).filter(Boolean),
+  );
+  items.push(...matchedItems);
   // Ghost transfer imports: soft-delete + auto-approve unapproved ones.
   // Includes ghosts only present in DDB (not in this delta batch).
-  items.push(...ghostItems);
-  ghostHidden = ghostItems.length;
+  const uniqueGhosts = ghostItems.filter((i) => !matchedHideIds.has(i.ynabId));
+  items.push(...uniqueGhosts);
+  ghostHidden = uniqueGhosts.length + matchedHideIds.size;
+
+  const hideIds = new Set([...ghostIds, ...matchedHideIds]);
+  const transferApprovals = autoApproveUnapprovedTransferLegs(
+    planId,
+    ghostScan,
+    pendingSk,
+    hideIds,
+  );
+  items.push(...transferApprovals);
 
   const schedR = await ynab.listScheduled(ynabPlanId, last);
   knowledge = Math.max(knowledge, schedR.serverKnowledge);
@@ -804,6 +926,7 @@ async function deltaPull() {
     itemsUpserted: items.length,
     skippedPendingPush: skippedPending,
     ghostTransferImportsHidden: ghostHidden || ghostItems.length,
+    transferLegsAutoApproved: transferApprovals.length,
     plaidEnrich,
   };
 }
@@ -1579,6 +1702,7 @@ module.exports = {
   tombstoneTxnItem,
   matchedCounterpartTombstones,
   ghostTransferImportTombstones,
+  autoApproveUnapprovedTransferLegs,
   dateDiffDays,
   ddbTxnToYnabShape,
   mergeLedgerForGhostScan,
