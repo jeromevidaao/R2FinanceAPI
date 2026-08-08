@@ -341,11 +341,29 @@ exports.handler = async (event) => {
           error: 'ynabTxnId and categoryYnabId required',
         });
       }
+      // 1) Write category to DynamoDB + mark PENDING_PUSH
+      // 2) Immediately drain push queue → YNAB API (unless push=false)
       const marked = await sync.categorizeTransaction(body);
-      // Optional immediate push
       let push;
       if (body.push !== false) {
-        push = await sync.pushPending({ limit: 5 });
+        push = await sync.pushPending({ limit: 10 });
+        const failedForTxn = (push?.results || []).find(
+          (r) =>
+            r &&
+            r.ok === false &&
+            (r.ynabTxnId === body.ynabTxnId ||
+              String(r.sk || '').includes(body.ynabTxnId)),
+        );
+        if (failedForTxn || (push?.failed > 0 && push?.pushed === 0)) {
+          return respond(502, {
+            error:
+              failedForTxn?.error ||
+              push?.error ||
+              'Category saved in R2Finance but YNAB push failed',
+            marked,
+            push,
+          });
+        }
       }
       return respond(200, { marked, push });
     }
