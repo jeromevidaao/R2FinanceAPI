@@ -438,4 +438,70 @@ describe('ghostTransferImportTombstones', () => {
     assert.equal(dateDiffDays('2026-08-07', '2026-08-07'), 0);
     assert.equal(dateDiffDays(null, '2026-08-07'), Infinity);
   });
+
+  it('mergeLedgerForGhostScan overlays delta on DDB so ghosts outside delta are found', () => {
+    const {
+      mergeLedgerForGhostScan,
+      ghostTransferImportTombstones: scan,
+    } = require('../src/lib/sync');
+    // Ghost only in DDB (not in this knowledge delta).
+    const ddbRows = [
+      {
+        sk: 'TXN#import-ghost',
+        ynabId: 'import-ghost',
+        accountId: checkin,
+        date: '2026-08-07',
+        amount,
+        approved: false,
+        payload: {
+          id: 'import-ghost',
+          account_id: checkin,
+          date: '2026-08-07',
+          amount,
+          approved: false,
+          category_id: null,
+        },
+      },
+      {
+        sk: 'TXN#xfer-out',
+        ynabId: 'xfer-out',
+        accountId: checkin,
+        date: '2026-08-07',
+        amount,
+        approved: true,
+        payload: {
+          id: 'xfer-out',
+          account_id: checkin,
+          date: '2026-08-07',
+          amount,
+          approved: true,
+          transfer_account_id: freedom,
+          transfer_transaction_id: 'xfer-in',
+        },
+      },
+      {
+        sk: 'TXN#xfer-in',
+        ynabId: 'xfer-in',
+        accountId: freedom,
+        date: '2026-08-07',
+        amount: -amount,
+        approved: true,
+        payload: {
+          id: 'xfer-in',
+          account_id: freedom,
+          date: '2026-08-07',
+          amount: -amount,
+          approved: true,
+          transfer_account_id: checkin,
+          transfer_transaction_id: 'xfer-out',
+        },
+      },
+    ];
+    // Empty delta (nothing changed this tick) — must still find the ghost.
+    const merged = mergeLedgerForGhostScan(ddbRows, []);
+    const items = scan('default', merged);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].ynabId, 'import-ghost');
+    assert.equal(items[0].syncStatus, 'PENDING_PUSH');
+  });
 });

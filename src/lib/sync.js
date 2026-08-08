@@ -190,6 +190,56 @@ function dateDiffDays(a, b) {
 }
 
 /**
+ * Map a DDB TXN row to the YNAB-shaped object ghost/match helpers expect.
+ * Delta pull only returns changed rows — ghosts already in DDB must still
+ * be visible to detection, so we merge ledger + delta via this shape.
+ */
+function ddbTxnToYnabShape(row) {
+  if (!row) return null;
+  const p = row.payload || {};
+  const id =
+    row.ynabId || p.id || String(row.sk || '').replace(/^TXN#/, '') || null;
+  if (!id) return null;
+  return {
+    id,
+    account_id: row.accountId || p.account_id || null,
+    date: row.date || p.date || null,
+    amount: row.amount ?? p.amount ?? null,
+    approved: row.approved ?? p.approved,
+    category_id: row.categoryId ?? p.category_id ?? null,
+    transfer_account_id: p.transfer_account_id || null,
+    transfer_transaction_id: p.transfer_transaction_id || null,
+    deleted: !!(row.deleted || p.deleted),
+    import_id: p.import_id || null,
+    payee_id: row.payeeId ?? p.payee_id ?? null,
+    payee_name: p.payee_name || null,
+    import_payee_name: p.import_payee_name || null,
+    cleared: row.cleared || p.cleared || null,
+    memo: row.memo ?? p.memo ?? null,
+  };
+}
+
+/**
+ * Merge live DDB ledger + this-pull YNAB delta into one list for ghost
+ * detection. Delta rows win (fresher YNAB state).
+ *
+ * @param {object[]} ddbRows
+ * @param {object[]} ynabDelta
+ * @returns {object[]}
+ */
+function mergeLedgerForGhostScan(ddbRows, ynabDelta) {
+  const byId = new Map();
+  for (const row of ddbRows || []) {
+    const shaped = ddbTxnToYnabShape(row);
+    if (shaped && shaped.id) byId.set(shaped.id, shaped);
+  }
+  for (const t of ynabDelta || []) {
+    if (t && t.id) byId.set(t.id, t);
+  }
+  return [...byId.values()];
+}
+
+/**
  * YNAB sometimes leaves a bank-import "Category Needed / Needs approval" row
  * on the source account *after* a real transfer pair already exists:
  *
@@ -639,10 +689,15 @@ async function deltaPull() {
     if (Object.keys(e).length) enrichBySk.set(row.sk, e);
   }
 
-  // Hide YNAB's extra bank-import when a real transfer pair already exists.
+  // Ghost scan needs the full ledger: delta alone omits already-synced rows
+  // (the Category Needed import may not appear in this knowledge window).
+  const ghostScan = mergeLedgerForGhostScan(
+    existingForEnrich,
+    txnsR.transactions,
+  );
   const ghostItems = ghostTransferImportTombstones(
     planId,
-    txnsR.transactions,
+    ghostScan,
     pendingSk,
   );
   const ghostIds = new Set(ghostItems.map((i) => i.ynabId).filter(Boolean));
@@ -690,7 +745,9 @@ async function deltaPull() {
     ...matchedCounterpartTombstones(planId, txnsR.transactions, pendingSk),
   );
   // Ghost transfer imports: soft-delete + auto-approve unapproved ones.
+  // Includes ghosts only present in DDB (not in this delta batch).
   items.push(...ghostItems);
+  ghostHidden = ghostItems.length;
 
   const schedR = await ynab.listScheduled(ynabPlanId, last);
   knowledge = Math.max(knowledge, schedR.serverKnowledge);
@@ -1523,5 +1580,7 @@ module.exports = {
   matchedCounterpartTombstones,
   ghostTransferImportTombstones,
   dateDiffDays,
+  ddbTxnToYnabShape,
+  mergeLedgerForGhostScan,
   reconcileMissingYnabTxns,
 };
