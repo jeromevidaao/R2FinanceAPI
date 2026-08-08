@@ -4,32 +4,20 @@
 
 Bank / card feed lines like `AMAZON MKTPL*BP4BF1BC1` land in YNAB → DynamoDB as ledger `TXN#` rows, but **without line-item titles**. Enrich those rows with the matching Amazon order (items, order #, payment last4).
 
-## Is there an official Amazon API? (AWS-viable)
+## Is there an official Amazon API?
 
-**Email / Gmail is out of scope** for production — R2Finance runs on Lambda; we will not depend on inbox access.
+| API | Fits personal MKTPL charges? |
+|-----|------------------------------|
+| Selling Partner API | No — seller catalog / orders you *sell* |
+| Amazon Business API | Only if Business account + approved app |
+| Login with Amazon | Identity only, not order history |
+| **Consumer order history** | **No public API** |
 
-| API | What it returns | Fits household MKTPL? | AWS-friendly? |
-|-----|-----------------|------------------------|---------------|
-| **Amazon Data Portability** (`portability::physical_orders`) via Login with Amazon OAuth | **Item titles, ASIN, qty, orderId, orderDate, totalOwed** | **Yes — personal retail orders** | **Yes** (refresh token in SSM) |
-| Data Portability physical orders schema | **No ship-to / delivery address** in published schema | Items yes; location **no** | Yes |
-| **Amazon Business Reporting API** | Line items + **shipment / ship-to address** | Only if buys go through **Amazon Business** | Yes (LWA + Business app) |
-| Selling Partner Orders API | Orders you *sell* on Marketplace | No | N/A |
-| Username/password “Amazon API” | Does not exist | — | — |
-| Website scrape (`amazon-orders`) | Items + recipient address | Fragile (WAF/bot) | Poor on Lambda |
+So a consumer enrichment path is either:
 
-### Recommended production path (no email)
-
-1. **Register** an Amazon developer app with **Amazon Data Portability** (Category-2: identity + security review).  
-2. Scopes: `portability::physical_orders` (items). Optionally Business Reporting if you migrate Pine supplies to AB.  
-3. One-time household OAuth (Login with Amazon) → store **refresh token** in SSM (`/r2finance/amazon/portability`).  
-4. Lambda job: create query → poll → download JSON → match DDB `AMAZON MKTPL*` by **amount + date** (and orderId when available).  
-5. Persist on `TXN#`: `amazonOrderId`, `items[]`, `asins[]`, `matchConfidence`.  
-
-**Delivery location gap:** official Data Portability **physical_orders** fields are product-centric (`productName`, `asin`, `quantity`, `totalOwed`, `orderId`) — **not** street address. For ship-to you need either Amazon Business shipment reports, or accept “unit / household address” from your own address book (not live from Amazon).
-
-### Unofficial scrape (local POC only)
-
-The `amazon-orders` script remains a **desktop** experiment. It can show items + recipient address when login works, but **do not** ship scrape-to-Lambda as the product path.
+1. **Unofficial website session** (this POC) — parse Your Orders / Your Transactions after login  
+2. Manual CSV export from Amazon order history reports  
+3. Parse order-confirmation email in Gmail (future alternative)
 
 ## Credentials (SSM only — never git)
 
