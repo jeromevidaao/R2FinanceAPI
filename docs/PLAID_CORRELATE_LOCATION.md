@@ -87,16 +87,22 @@ posted id (keep location if already set).
 **Entity inheritance** only lifts total location a little (~+1%) unless you
 build a long-lived merchant location store across months.
 
-### Making location useful in product
+### Making location useful in product (implemented)
 
 1. **Always store match** (`plaidTransactionId`, tier, confidence) even when loc null.
-2. **Persist merchant location cache** in DDB (`MERCHANT#entityId` → lat/lon/address)
-   whenever Plaid returns a pin — reuse forever.
-3. **Geocode once** for high-value in-store misses (Voyager Cafe, Nth St Cafe, 7-Eleven):
-   query = `merchant_name` (+ city if Plaid ever sent city-only).
-   Cache under `merchant_entity_id` or normalized name.
-   Skip `payment_channel` ∈ {online, other} unless user tags a place.
-4. **UI:** show pin only if `locationConfidence ≥ 0.65` (or user-confirmed).
+2. **Persist merchant location cache** in DDB (`MERCHANT#E#{entityId}` / `MERCHANT#N#{nameKey}`)
+   whenever we get a pin — reuse forever across pulls.
+3. **Multi-city safety:** if the same entity/name was seen in 2+ cities, mark
+   `ambiguous` and **do not inherit** (Starbucks SJ ≠ Starbucks Seattle).
+4. **Harvest** location pins from a longer Plaid window (default 180d) + existing
+   TXN# rows, not only the match window.
+5. **Second pass** on inbox: rows with `plaidTransactionId` but no
+   `locationDisplay` re-resolve from durable cache.
+6. **Geocode** (Nominatim, rate-limited, ≤~12–18/run) for physical in-store
+   misses, biased by **user city priors** from prior pins.
+   - National brands (Starbucks, Uber, …) never bare-geocode without a city.
+   - Local merchants (Voyager Cafe, Don’s Cafe, …) get `Name, Seattle, WA` etc.
+7. **UI:** show pin when `locationDisplay` is set (City, ST).
 
 Suggested enrichment fields on `TXN#` (or `ENRICH#TXN#{id}`):
 

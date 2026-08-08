@@ -16,10 +16,12 @@ const {
   buildMerchantLocationCache,
   matchLedgerToPlaid,
   attachLocations,
+  resolveLocation,
   enrichmentRecord,
   formatLocation,
   ynabToDollars,
 } = require('./plaidMatch');
+const merchantLocation = require('./merchantLocation');
 
 /** Top-level DDB fields we stamp / preserve across YNAB re-writes. */
 const ENRICH_FIELDS = [
@@ -50,12 +52,14 @@ function pickEnrichment(row) {
 /**
  * US → "City, ST". Outside US → "City, Country".
  * Null/missing country treated as US (Plaid country_codes: ['US']).
+ * Falls back to a short address line when city is missing.
  */
 function formatLocationDisplay(loc) {
   if (!loc || typeof loc !== 'object') return null;
   const city = String(loc.city || '').trim();
   const region = String(loc.region || '').trim();
   const countryRaw = String(loc.country || '').trim();
+  const address = String(loc.address || '').trim();
   const c = countryRaw.toUpperCase();
   const isUS =
     !c ||
@@ -68,11 +72,23 @@ function formatLocationDisplay(loc) {
     if (city && region) return `${city}, ${region}`;
     if (city) return city;
     if (region) return region;
+    if (address) return address;
     return null;
   }
   if (city && countryRaw) return `${city}, ${countryRaw}`;
   if (city) return city;
   if (countryRaw) return countryRaw;
+  if (address) return address;
+  return null;
+}
+
+/** Plaid PFC is often an object — store a short string for UI. */
+function formatPfc(pfc) {
+  if (!pfc) return null;
+  if (typeof pfc === 'string') return pfc;
+  if (typeof pfc === 'object') {
+    return pfc.primary || pfc.detailed || null;
+  }
   return null;
 }
 
@@ -191,9 +207,16 @@ async function fetchPlaidWindow(accessToken, startDate, endDate) {
 
 /**
  * Build combined Plaid pool + account mask map from all connected items.
+ *
+ * @param {{ days?: number, cacheDays?: number }} opts
+ *  - days: match window for ledger ↔ Plaid
+ *  - cacheDays: longer window used only to harvest location pins (default max(days, 180))
  */
-async function loadPlaidPool({ days = 60 } = {}) {
-  const startDate = isoDaysAgo(days);
+async function loadPlaidPool({ days = 60, cacheDays } = {}) {
+  const matchDays = days;
+  const locDays = Math.max(cacheDays || 180, matchDays);
+  const matchStart = isoDaysAgo(matchDays);
+  const cacheStart = isoDaysAgo(locDays);
   const endDate = todayIso();
   const connected = await loadConnectedPlaidItems();
   if (!connected.length) {
@@ -201,10 +224,11 @@ async function loadPlaidPool({ days = 60 } = {}) {
       plaidTxns: [],
       plaidAccountById: new Map(),
       chaseMasks: new Set(),
-      locationCache: { byEntity: new Map(), byName: new Map() },
+      locationCache: merchantLocation.emptyCache(),
       connected: [],
-      startDate,
+      startDate: matchStart,
       endDate,
+      cacheStart,
     };
   }
 
@@ -225,9 +249,10 @@ async function loadPlaidPool({ days = 60 } = {}) {
       if (a.mask) masks.add(a.mask);
     }
     try {
+      // One longer fetch — use full window for cache, filter for match pool.
       const { transactions, accounts } = await fetchPlaidWindow(
         item.accessToken,
-        startDate,
+        cacheStart,
         endDate,
       );
       for (const a of accounts) {
@@ -242,8 +267,9 @@ async function loadPlaidPool({ days = 60 } = {}) {
         if (mask) masks.add(mask);
       }
       for (const t of transactions) {
-        plaidTxns.push(t);
         historyForCache.push(t);
+        const d = t.date || t.authorized_date;
+        if (d && d >= matchStart) plaidTxns.push(t);
       }
     } catch (e) {
       console.warn(
@@ -253,19 +279,43 @@ async function loadPlaidPool({ days = 60 } = {}) {
     }
   }
 
-  const locationCache = buildMerchantLocationCache(historyForCache);
+  // Layer: durable DDB MERCHANT# → harvested TXN pins → current Plaid window.
+  let locationCache = merchantLocation.emptyCache();
+  try {
+    const durable = await merchantLocation.loadMerchantCacheFromDdb();
+    locationCache = merchantLocation.mergeCaches(locationCache, durable.cache);
+  } catch (e) {
+    console.warn('loadMerchantCacheFromDdb', e.message);
+  }
+
+  // Existing TXN pins (any age) — long-lived household memory.
+  try {
+    const existingTxns = await ddb.queryPk(ddb.planPk(ledgerPlanId), 'TXN#');
+    merchantLocation.harvestTxnLocations(locationCache, existingTxns);
+  } catch (e) {
+    console.warn('harvestTxnLocations', e.message);
+  }
+
+  const windowCache = buildMerchantLocationCache(historyForCache);
+  locationCache = merchantLocation.mergeCaches(locationCache, windowCache);
+
   return {
     plaidTxns,
+    plaidById: new Map(plaidTxns.map((t) => [t.transaction_id, t])),
+    // Full history for location re-attach of older matched ids still in window
+    plaidByIdAll: new Map(historyForCache.map((t) => [t.transaction_id, t])),
     plaidAccountById,
     masks,
     locationCache,
+    historyForCache,
     connected: connected.map((c) => ({
       email: c.email,
       bankId: c.bankId,
       accounts: (c.accountsPreview || []).length,
     })),
-    startDate,
+    startDate: matchStart,
     endDate,
+    cacheStart,
   };
 }
 
@@ -317,7 +367,7 @@ function enrichmentFromMatch(matchWithLoc) {
     plaidMerchantName: base.plaidMerchantName || null,
     plaidMerchantEntityId: base.plaidMerchantEntityId || null,
     plaidPaymentChannel: base.plaidPaymentChannel || null,
-    plaidPfc: matchWithLoc.plaid?.personal_finance_category || null,
+    plaidPfc: formatPfc(matchWithLoc.plaid?.personal_finance_category),
     plaidWebsite: matchWithLoc.plaid?.website || null,
     matchTier: base.matchTier,
     matchConfidence: base.matchConfidence,
@@ -329,6 +379,120 @@ function enrichmentFromMatch(matchWithLoc) {
   };
 }
 
+function enrichmentFromResolved(plaidTxn, resolved, existingMatch = {}) {
+  const location = resolved.location
+    ? formatLocation(resolved.location) || resolved.location
+    : null;
+  return {
+    plaidTransactionId:
+      existingMatch.plaidTransactionId || plaidTxn.transaction_id,
+    plaidMerchantName:
+      existingMatch.plaidMerchantName ||
+      plaidTxn.merchant_name ||
+      plaidTxn.name ||
+      null,
+    plaidMerchantEntityId:
+      existingMatch.plaidMerchantEntityId ||
+      plaidTxn.merchant_entity_id ||
+      null,
+    plaidPaymentChannel:
+      existingMatch.plaidPaymentChannel || plaidTxn.payment_channel || null,
+    plaidPfc:
+      existingMatch.plaidPfc ||
+      formatPfc(plaidTxn.personal_finance_category),
+    plaidWebsite: existingMatch.plaidWebsite || plaidTxn.website || null,
+    matchTier: existingMatch.matchTier || null,
+    matchConfidence: existingMatch.matchConfidence ?? null,
+    location,
+    locationSource: resolved.source || null,
+    locationConfidence: resolved.confidence || 0,
+    locationDisplay: formatLocationDisplay(location),
+    enrichedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Geocode geocode_candidates, seed cache, re-resolve.
+ * @returns number of rows that gained a location
+ */
+async function applyGeocodePass(locatedRows, locationCache, { maxQueries = 12 } = {}) {
+  const candidates = locatedRows.filter(
+    (r) => r.locationSource === 'geocode_candidate' && !r.location,
+  );
+  if (!candidates.length) {
+    return { geocoded: 0, queriesUsed: 0 };
+  }
+  // Need raw plaid on rows — attachLocations strips rawPlaid; recover from plaid field
+  const withRaw = candidates.map((r) => ({
+    ...r,
+    rawPlaid: r.plaid || r.rawPlaid,
+  }));
+  const priors = merchantLocation.userCityPriors(locationCache, 5);
+  const { results, queriesUsed } = await merchantLocation.geocodeCandidates(
+    withRaw,
+    priors,
+    { maxQueries },
+  );
+  let geocoded = 0;
+  for (const row of locatedRows) {
+    const id = row.plaid?.transaction_id || row.plaidTransactionId;
+    if (!id || !results.has(id)) continue;
+    const hit = results.get(id);
+    row.location = hit.location;
+    row.locationSource = 'geocode';
+    row.locationConfidence = 0.55;
+    row.geocodeQuery = hit.query;
+    geocoded += 1;
+    merchantLocation.ingestFormatted(locationCache, {
+      entityId: row.plaid?.merchant_entity_id || null,
+      name: hit.merchant,
+      location: hit.location,
+      sourceTxnId: id,
+      source: 'geocode',
+    });
+  }
+  return { geocoded, queriesUsed, priors };
+}
+
+/**
+ * Build a synthetic Plaid-like object from already-stamped TXN enrichment
+ * so we can re-resolve location without another Plaid round-trip.
+ */
+function syntheticPlaidFromTxn(t) {
+  return {
+    transaction_id: t.plaidTransactionId,
+    merchant_name: t.plaidMerchantName || null,
+    name: t.plaidMerchantName || t.payload?.import_payee_name || null,
+    merchant_entity_id: t.plaidMerchantEntityId || null,
+    payment_channel: t.plaidPaymentChannel || null,
+    location: t.location || {},
+    personal_finance_category: t.plaidPfc || null,
+    website: t.plaidWebsite || null,
+  };
+}
+
+/**
+ * Re-resolve location for rows that already have plaidTransactionId but no pin.
+ * Prefers live Plaid row when present; falls back to stamped merchant fields.
+ */
+function relocateExistingMatches(ddbRows, pool) {
+  const out = [];
+  const byId = pool?.plaidByIdAll || pool?.plaidById || new Map();
+  const cache = pool?.locationCache || merchantLocation.emptyCache();
+  for (const t of ddbRows) {
+    if (!t?.plaidTransactionId) continue;
+    if (t.locationDisplay || (t.location && formatLocationDisplay(t.location))) {
+      continue;
+    }
+    const plaidTxn = byId.get(t.plaidTransactionId) || syntheticPlaidFromTxn(t);
+    const resolved = resolveLocation(plaidTxn, cache, {
+      offerGeocode: true,
+    });
+    out.push({ row: t, plaidTxn, resolved });
+  }
+  return out;
+}
+
 /**
  * Enrich a list of DDB TXN rows in place (putItem merge).
  * @param {object[]} ddbRows full TXN items
@@ -338,13 +502,14 @@ async function enrichTxnRows(ddbRows, opts = {}) {
   const days = opts.days || 60;
   const onlyMissing = opts.onlyMissing !== false;
   const spendingOnly = opts.spendingOnly !== false;
+  const runGeocode = opts.runGeocode !== false;
+  const maxGeocode = opts.maxGeocode ?? 12;
 
   let candidates = ddbRows.filter((t) => t && !t.deleted);
   if (onlyMissing) {
     candidates = candidates.filter((t) => !t.plaidTransactionId);
   }
   if (spendingOnly) {
-    // Outflows (and small inflows like refunds still useful — keep all signed)
     candidates = candidates.filter((t) => {
       const amt = t.amount ?? t.payload?.amount;
       return amt != null;
@@ -354,8 +519,8 @@ async function enrichTxnRows(ddbRows, opts = {}) {
     return { attempted: 0, matched: 0, withLocation: 0, skipped: ddbRows.length };
   }
 
-  const pool = await loadPlaidPool({ days });
-  if (!pool.plaidTxns.length) {
+  const pool = await loadPlaidPool({ days, cacheDays: opts.cacheDays || 180 });
+  if (!pool.plaidTxns.length && !(pool.historyForCache || []).length) {
     return {
       attempted: candidates.length,
       matched: 0,
@@ -411,9 +576,29 @@ async function enrichTxnRows(ddbRows, opts = {}) {
     pool.plaidTxns,
     pool.plaidAccountById,
   );
+  // offerGeocode true → mark candidates; we may fill via Nominatim below
   const located = attachLocations(matchResult, pool.locationCache, {
-    offerGeocode: false, // only stamp real location data for now
+    offerGeocode: true,
   });
+
+  let geoStats = { geocoded: 0, queriesUsed: 0 };
+  if (runGeocode) {
+    geoStats = await applyGeocodePass(located.rows, pool.locationCache, {
+      maxQueries: maxGeocode,
+    });
+  }
+
+  // Seed durable cache from every plaid_direct / geocode pin we now know
+  for (const m of located.rows) {
+    if (!m.location) continue;
+    merchantLocation.ingestFormatted(pool.locationCache, {
+      entityId: m.plaid?.merchant_entity_id || null,
+      name: m.plaid?.merchant_name || m.plaid?.name,
+      location: m.location,
+      sourceTxnId: m.plaid?.transaction_id,
+      source: m.locationSource || 'plaid',
+    });
+  }
 
   let matched = 0;
   let withLocation = 0;
@@ -424,28 +609,48 @@ async function enrichTxnRows(ddbRows, opts = {}) {
     const existing = rowByYnab.get(m.ynabId);
     if (!existing) continue;
     const enrich = enrichmentFromMatch(m);
-    // Always stamp match info even without location
+    // Strip nulls so DDB does not store typed-NULL attributes
+    const clean = {};
+    for (const [k, v] of Object.entries(enrich)) {
+      if (v !== undefined && v !== null) clean[k] = v;
+    }
     const item = {
       ...existing,
-      ...enrich,
+      ...clean,
       updatedAt: now,
     };
     writes.push(item);
     matched += 1;
-    if (enrich.locationDisplay || enrich.location) withLocation += 1;
+    if (clean.locationDisplay || clean.location) withLocation += 1;
   }
 
-  // batchWrite 25 at a time
   if (writes.length) await ddb.batchWrite(writes);
+
+  // Persist merchant pins for next pull (cheap, cumulative coverage).
+  let merchantPersisted = 0;
+  try {
+    const p = await merchantLocation.persistMerchantCache(pool.locationCache);
+    merchantPersisted = p.written;
+  } catch (e) {
+    console.warn('persistMerchantCache', e.message);
+  }
 
   return {
     attempted: ledgerRows.length,
     matched,
     withLocation,
+    geocoded: geoStats.geocoded || 0,
+    geocodeQueries: geoStats.queriesUsed || 0,
+    merchantPersisted,
+    bySource: located.bySource,
     tierCounts: matchResult.tierCounts,
     plaidTxnCount: pool.plaidTxns.length,
     connected: pool.connected,
-    window: { start: pool.startDate, end: pool.endDate },
+    window: {
+      start: pool.startDate,
+      end: pool.endDate,
+      cacheStart: pool.cacheStart,
+    },
   };
 }
 
@@ -474,8 +679,9 @@ async function enrichNewSpending({ days = 45 } = {}) {
 
 /**
  * Inbox needs-attention (unapproved + uncategorized on-budget).
+ * Single Plaid pool load: match missing ids + relocate already-matched + geocode.
  */
-async function enrichInboxNeedsAttention({ days = 90 } = {}) {
+async function enrichInboxNeedsAttention({ days = 90, runGeocode = true } = {}) {
   const sync = require('./sync');
   const inbox = await sync.listInbox();
   const ids = new Set((inbox.transactions || []).map((t) => t.ynabId).filter(Boolean));
@@ -488,27 +694,126 @@ async function enrichInboxNeedsAttention({ days = 90 } = {}) {
     const id = t.ynabId || String(t.sk || '').replace(/^TXN#/, '');
     return ids.has(id);
   });
-  // Include already-matched without location? Re-match only missing plaid id.
-  // If already has plaid id but no locationDisplay, try re-attach from pool.
+
+  // Prefer one enrichTxnRows pass for unmatched (builds pool, matches, geocodes, persists).
   const missing = rows.filter((t) => !t.plaidTransactionId);
   const result = await enrichTxnRows(missing, {
     days,
     onlyMissing: true,
     spendingOnly: false,
+    runGeocode,
+    maxGeocode: runGeocode ? 10 : 0,
+    cacheDays: 180,
   });
 
-  // Second pass: rows with match but no locationDisplay — re-resolve location only
-  const needLoc = rows.filter(
-    (t) => t.plaidTransactionId && !t.locationDisplay && !t.location,
+  // Reload rows after first pass so newly matched are excluded from relocate.
+  const fresh = await ddb.queryPk(ddb.planPk(ledgerPlanId), 'TXN#');
+  const byId = new Map();
+  for (const t of fresh) {
+    const id = t.ynabId || String(t.sk || '').replace(/^TXN#/, '');
+    if (ids.has(id)) byId.set(id, t);
+  }
+  const needLoc = [...byId.values()].filter(
+    (t) =>
+      t.plaidTransactionId &&
+      !t.locationDisplay &&
+      !(t.location && formatLocationDisplay(t.location)),
   );
-  // Skip heavy re-fetch for needLoc if none — location cascade already ran on match.
-  void needLoc;
+
+  let relocated = 0;
+  let relocatedGeocoded = 0;
+  if (needLoc.length) {
+    try {
+      // No second Plaid fetch — durable MERCHANT# + harvested TXN pins + synthetic fields.
+      let locationCache = merchantLocation.emptyCache();
+      try {
+        const durable = await merchantLocation.loadMerchantCacheFromDdb();
+        locationCache = merchantLocation.mergeCaches(locationCache, durable.cache);
+      } catch (e) {
+        console.warn('loadMerchantCache relocate', e.message);
+      }
+      merchantLocation.harvestTxnLocations(locationCache, fresh);
+
+      const pool = { locationCache, plaidById: new Map(), plaidByIdAll: new Map() };
+      const pending = relocateExistingMatches(needLoc, pool);
+
+      const geoCandidates = pending
+        .filter((p) => p.resolved.source === 'geocode_candidate' && !p.resolved.location)
+        .map((p) => ({
+          plaid: p.plaidTxn,
+          rawPlaid: p.plaidTxn,
+          plaidTransactionId: p.plaidTxn.transaction_id,
+        }));
+      if (runGeocode && geoCandidates.length) {
+        const priors = merchantLocation.userCityPriors(locationCache, 5);
+        // Keep budget small on the relocate pass (first pass already geocoded).
+        const { results } = await merchantLocation.geocodeCandidates(
+          geoCandidates,
+          priors,
+          { maxQueries: 8 },
+        );
+        for (const p of pending) {
+          const id = p.plaidTxn.transaction_id;
+          if (results.has(id) && !p.resolved.location) {
+            const hit = results.get(id);
+            p.resolved = {
+              location: hit.location,
+              source: 'geocode',
+              confidence: 0.55,
+              geocodeQuery: hit.query,
+            };
+            relocatedGeocoded += 1;
+            merchantLocation.ingestFormatted(locationCache, {
+              entityId: p.plaidTxn.merchant_entity_id,
+              name: hit.merchant,
+              location: hit.location,
+              sourceTxnId: id,
+              source: 'geocode',
+            });
+          }
+        }
+      }
+
+      const now = Date.now();
+      const writes = [];
+      for (const p of pending) {
+        if (!p.resolved.location) continue;
+        const enrich = enrichmentFromResolved(p.plaidTxn, p.resolved, {
+          plaidTransactionId: p.row.plaidTransactionId,
+          plaidMerchantName: p.row.plaidMerchantName,
+          plaidMerchantEntityId: p.row.plaidMerchantEntityId,
+          plaidPaymentChannel: p.row.plaidPaymentChannel,
+          plaidPfc: p.row.plaidPfc,
+          matchTier: p.row.matchTier,
+          matchConfidence: p.row.matchConfidence,
+        });
+        const clean = {};
+        for (const [k, v] of Object.entries(enrich)) {
+          if (v !== undefined && v !== null) clean[k] = v;
+        }
+        writes.push({ ...p.row, ...clean, updatedAt: now });
+        relocated += 1;
+      }
+      if (writes.length) await ddb.batchWrite(writes);
+      try {
+        await merchantLocation.persistMerchantCache(locationCache);
+      } catch (e) {
+        console.warn('persistMerchantCache relocate', e.message);
+      }
+    } catch (e) {
+      console.warn('relocateExistingMatches', e.message);
+    }
+  }
 
   return {
     scope: 'inbox',
     inboxCount: ids.size,
     ...result,
     alreadyEnriched: rows.length - missing.length,
+    needLoc: needLoc.length,
+    relocated,
+    relocatedGeocoded,
+    withLocation: (result.withLocation || 0) + relocated,
   };
 }
 
@@ -543,6 +848,7 @@ module.exports = {
   ENRICH_FIELDS,
   pickEnrichment,
   formatLocationDisplay,
+  formatPfc,
   loadConnectedPlaidItems,
   loadPlaidPool,
   enrichTxnRows,
@@ -550,4 +856,7 @@ module.exports = {
   enrichInboxNeedsAttention,
   enrichAfterPull,
   enrichmentFromMatch,
+  enrichmentFromResolved,
+  relocateExistingMatches,
+  applyGeocodePass,
 };

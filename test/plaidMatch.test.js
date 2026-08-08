@@ -170,4 +170,118 @@ describe('plaidMatch tiered match + location', () => {
     assert.equal(cf.location, null);
     assert.equal(cf.locationSource, 'geocode_candidate');
   });
+
+  it('does not inherit when merchant has multiple cities (ambiguous)', () => {
+    const multi = [
+      {
+        transaction_id: 'sb1',
+        merchant_entity_id: 'ent-sb',
+        merchant_name: 'Starbucks',
+        name: 'Starbucks',
+        location: { city: 'San Jose', region: 'CA', lat: 37.3, lon: -121.9 },
+      },
+      {
+        transaction_id: 'sb2',
+        merchant_entity_id: 'ent-sb',
+        merchant_name: 'Starbucks',
+        name: 'Starbucks',
+        location: { city: 'Seattle', region: 'WA', lat: 47.6, lon: -122.3 },
+      },
+      {
+        transaction_id: 'sb3',
+        merchant_entity_id: 'ent-sb',
+        merchant_name: 'Starbucks',
+        name: 'STARBUCKS STORE 1234',
+        payment_channel: 'in store',
+        account_id: 'pa1',
+        date: '2026-08-07',
+        amount: 5.5,
+        location: {},
+      },
+    ];
+    const cache = buildMerchantLocationCache(multi);
+    const ent = cache.byEntity.get('ent-sb');
+    assert.equal(ent.ambiguous, true);
+    const r = matchLedgerToPlaid(
+      [
+        {
+          ynabId: 'ysb',
+          date: '2026-08-07',
+          amount: -5500,
+          accountMask: '6553',
+          payeeName: 'Starbucks',
+        },
+      ],
+      multi,
+      accounts,
+    );
+    const located = attachLocations(r, cache);
+    const row = located.rows.find((x) => x.ynabId === 'ysb');
+    assert.equal(row.location, null);
+    assert.equal(row.locationSource, 'geocode_candidate');
+  });
+});
+
+describe('merchantLocation helpers', () => {
+  const {
+    merchantNameKey,
+    isMultiCityBrand,
+    geocodeQueriesForMerchant,
+    emptyCache,
+    mergeIntoBucket,
+    lookupEntity,
+  } = require('../src/lib/merchantLocation');
+
+  it('soft-normalizes store numbers and LLC', () => {
+    assert.equal(merchantNameKey('Starbucks Store 1234'), 'starbucks');
+    assert.equal(merchantNameKey('Cleanforme LLC'), 'cleanforme');
+  });
+
+  it('flags national brands', () => {
+    assert.equal(isMultiCityBrand('Starbucks #99'), true);
+    assert.equal(isMultiCityBrand("Don's Cafe"), false);
+    assert.equal(isMultiCityBrand('Voyager Coffee'), false);
+  });
+
+  it('builds geocode queries with city priors for local merchants', () => {
+    const qs = geocodeQueriesForMerchant(
+      {
+        merchant_name: "Don's Cafe",
+        name: "DON'S CAFE",
+        payment_channel: 'in store',
+        location: {},
+      },
+      [{ city: 'Seattle', region: 'WA' }],
+    );
+    assert.ok(qs.some((q) => /Seattle/i.test(q)));
+  });
+
+  it('refuses bare geocode for multi-city brands without city', () => {
+    const qs = geocodeQueriesForMerchant(
+      {
+        merchant_name: 'Starbucks',
+        payment_channel: 'in store',
+        location: {},
+      },
+      [],
+    );
+    assert.equal(qs.length, 0);
+  });
+
+  it('lookupEntity returns null when ambiguous', () => {
+    const cache = emptyCache();
+    mergeIntoBucket(
+      cache.byEntity,
+      'e1',
+      { city: 'A', region: 'CA', lat: 1, lon: 2 },
+      { merchant: 'X' },
+    );
+    mergeIntoBucket(
+      cache.byEntity,
+      'e1',
+      { city: 'B', region: 'WA', lat: 3, lon: 4 },
+      { merchant: 'X' },
+    );
+    assert.equal(lookupEntity(cache, 'e1'), null);
+  });
 });

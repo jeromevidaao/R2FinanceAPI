@@ -89,36 +89,28 @@ function formatLocation(loc) {
 
 /**
  * Build merchant → location cache from a Plaid history dump.
- * Prefer entity_id; fall back to normalized merchant name.
+ * Multi-city aware (ambiguous merchants are not inherited).
+ * Implementation lives in merchantLocation.js.
  */
 function buildMerchantLocationCache(plaidTxns) {
-  const byEntity = new Map();
-  const byName = new Map();
-  for (const t of plaidTxns || []) {
-    const loc = formatLocation(t.location);
-    if (!loc) continue;
-    if (t.merchant_entity_id && !byEntity.has(t.merchant_entity_id)) {
-      byEntity.set(t.merchant_entity_id, {
-        location: loc,
-        sourceTxnId: t.transaction_id,
-        merchant: t.merchant_name || t.name,
-      });
-    }
-    const key = normName(t.merchant_name || t.name);
-    if (key && !byName.has(key)) {
-      byName.set(key, {
-        location: loc,
-        sourceTxnId: t.transaction_id,
-        merchant: t.merchant_name || t.name,
-      });
-    }
-  }
-  return { byEntity, byName };
+  // Lazy require avoids circular deps (merchantLocation → plaidMatch).
+  return require('./merchantLocation').buildMerchantLocationCache(plaidTxns);
+}
+
+/**
+ * Resolve a cache entry whether it is the legacy simple shape or multi-city.
+ * Returns null when ambiguous (multi-city brand with >1 city).
+ */
+function cacheHit(entry) {
+  if (!entry || !entry.location) return null;
+  if (entry.ambiguous) return null;
+  if (entry.cities && entry.cities.size > 1) return null;
+  return entry;
 }
 
 /**
  * Location cascade for a matched Plaid txn.
- * @returns {{ location, source: 'plaid_direct'|'merchant_entity'|'merchant_name'|'geocode_candidate'|null, geocodeQuery? }}
+ * @returns {{ location, source: 'plaid_direct'|'merchant_entity'|'merchant_name'|'geocode'|'geocode_candidate'|null, geocodeQuery? }}
  */
 function resolveLocation(plaidTxn, cache, { offerGeocode = true } = {}) {
   const direct = formatLocation(plaidTxn.location);
@@ -126,24 +118,36 @@ function resolveLocation(plaidTxn, cache, { offerGeocode = true } = {}) {
     return { location: direct, source: 'plaid_direct', confidence: 1 };
   }
 
-  if (plaidTxn.merchant_entity_id && cache?.byEntity?.has(plaidTxn.merchant_entity_id)) {
-    const hit = cache.byEntity.get(plaidTxn.merchant_entity_id);
+  const merchantLoc = require('./merchantLocation');
+
+  // Prefer multi-city-safe lookups when available.
+  const entityHit =
+    merchantLoc.lookupEntity(cache, plaidTxn.merchant_entity_id) ||
+    cacheHit(
+      plaidTxn.merchant_entity_id
+        ? cache?.byEntity?.get(plaidTxn.merchant_entity_id)
+        : null,
+    );
+  if (entityHit?.location) {
     return {
-      location: hit.location,
+      location: entityHit.location,
       source: 'merchant_entity',
       confidence: 0.85,
-      inheritedFromTxnId: hit.sourceTxnId,
+      inheritedFromTxnId: entityHit.sourceTxnId,
     };
   }
 
-  const nameKey = normName(plaidTxn.merchant_name || plaidTxn.name);
-  if (nameKey && cache?.byName?.has(nameKey)) {
-    const hit = cache.byName.get(nameKey);
+  const name = plaidTxn.merchant_name || plaidTxn.name;
+  const nameHit =
+    merchantLoc.lookupName(cache, name) ||
+    cacheHit(cache?.byName?.get(normName(name))) ||
+    cacheHit(cache?.byName?.get(merchantLoc.merchantNameKey(name)));
+  if (nameHit?.location) {
     return {
-      location: hit.location,
+      location: nameHit.location,
       source: 'merchant_name',
       confidence: 0.65,
-      inheritedFromTxnId: hit.sourceTxnId,
+      inheritedFromTxnId: nameHit.sourceTxnId,
     };
   }
 
@@ -153,10 +157,8 @@ function resolveLocation(plaidTxn, cache, { offerGeocode = true } = {}) {
     channel === 'in store' ||
     (!channel && !/ACH|PPD|WEB|PAYMENT|ORIG CO/i.test(plaidTxn.name || ''));
 
-  if (offerGeocode && isPhysical && (plaidTxn.merchant_name || plaidTxn.name)) {
-    const q = [plaidTxn.merchant_name || plaidTxn.name, plaidTxn.location?.city]
-      .filter(Boolean)
-      .join(', ');
+  if (offerGeocode && isPhysical && name) {
+    const q = [name, plaidTxn.location?.city].filter(Boolean).join(', ');
     return {
       location: null,
       source: 'geocode_candidate',
