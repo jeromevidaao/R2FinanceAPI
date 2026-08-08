@@ -422,17 +422,27 @@ exports.handler = async (event) => {
       return respond(200, {
         accounts: items
           .filter((i) => !i.deleted && !i.closed)
-          .map((i) => ({
-            ynabId: i.ynabId,
-            name: i.name,
-            type: i.type,
-            balance: i.balance ?? i.payload?.balance ?? 0,
-            onBudget: i.onBudget ?? i.payload?.on_budget ?? true,
-            closed: i.closed ?? i.payload?.closed ?? false,
-            note: i.payload?.note ?? null,
-            transferPayeeId: i.payload?.transfer_payee_id ?? null,
-          })),
+          .map((i) => {
+            const mapped = sync.mapAccount(i);
+            // Drop sync-only fields from REST list.
+            const { deleted, updatedAt, ...acct } = mapped;
+            return acct;
+          }),
       });
+    }
+
+    // PATCH /v1/accounts/{ynabId}  body: { alias: "nickname" | null }
+    // R2Finance-only nickname used in Categorization and the rest of the UI.
+    const accountAliasMatch = path.match(/^\/v1\/accounts\/([^/]+)$/);
+    if (accountAliasMatch && (method === 'PATCH' || method === 'POST')) {
+      const ynabId = decodeURIComponent(accountAliasMatch[1]);
+      const body = parseBody(event);
+      if (!Object.prototype.hasOwnProperty.call(body || {}, 'alias')) {
+        return respond(400, { error: 'alias required (string or null)' });
+      }
+      const account = await sync.setAccountAlias(ynabId, body.alias);
+      const { deleted, updatedAt, ...acct } = account;
+      return respond(200, { ok: true, account: acct });
     }
 
     if (method === 'GET' && path === '/v1/categories') {

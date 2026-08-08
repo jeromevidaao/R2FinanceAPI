@@ -34,6 +34,26 @@ describe('categorize API contract', () => {
   });
 });
 
+describe('account alias + mask', () => {
+  it('extracts last-4 from YNAB account names', () => {
+    const { extractAccountMask, mapAccount } = require('../src/lib/sync');
+    assert.equal(extractAccountMask('Chase Freedom 8053'), '8053');
+    assert.equal(extractAccountMask('Checking'), null);
+    const mapped = mapAccount({
+      ynabId: 'a1',
+      name: 'BoA Checkin 1234',
+      type: 'checking',
+      balance: 1000,
+      onBudget: true,
+      closed: false,
+      alias: 'Joint checking',
+    });
+    assert.equal(mapped.alias, 'Joint checking');
+    assert.equal(mapped.mask, '1234');
+    assert.equal(mapped.name, 'BoA Checkin 1234');
+  });
+});
+
 describe('mapTxn stable client id', () => {
   it('prefers clientId as stable id for device-created rows', () => {
     const { mapTxn } = require('../src/lib/sync');
@@ -113,6 +133,24 @@ describe('mapTxn stable client id', () => {
     });
     assert.equal(mapped.syncStatus, 'SYNCED');
     assert.equal(mapped.lastPushedAt, 1700000001000);
+  });
+
+  it('exposes parsed importPayeeName (never raw match-suggestion JSON)', () => {
+    const { mapTxn } = require('../src/lib/sync');
+    const mapped = mapTxn({
+      sk: 'TXN#import-payee',
+      ynabId: 'import-payee',
+      accountId: 'a',
+      date: '2026-08-07',
+      amount: -239350,
+      payload: {
+        import_payee_name: JSON.stringify({
+          importedPayee: 'Chase Credit Card',
+          accepted: false,
+        }),
+      },
+    });
+    assert.equal(mapped.importPayeeName, 'Chase Credit Card');
   });
 });
 

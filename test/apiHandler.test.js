@@ -33,6 +33,8 @@ describe('R2FinanceApiHandler', () => {
   it('ledger endpoints reject unauthenticated callers', async () => {
     const paths = [
       ['GET', '/v1/accounts'],
+      ['PATCH', '/v1/accounts/some-id'],
+      ['POST', '/v1/accounts/some-id'],
       ['GET', '/v1/transactions'],
       ['GET', '/v1/categories'],
       ['GET', '/v1/payees'],

@@ -6,6 +6,10 @@ const ddb = require('./ddb');
 const { ledgerPlanId } = require('./config');
 const { colorForCategory } = require('./categoryColors');
 const { pickEnrichment } = require('./plaidEnrich');
+const {
+  parseImportPayeeName,
+  resolveDisplayPayee,
+} = require('./displayPayee');
 
 /** Load existing category colors so re-import / delta never drifts user or assigned colors. */
 async function loadCategoryColorMap(planId) {
@@ -15,6 +19,60 @@ async function loadCategoryColorMap(planId) {
     if (c.ynabId && c.color) map.set(c.ynabId, c.color);
   }
   return map;
+}
+
+/**
+ * User-set account nicknames (aliases) live on ACCT# and must survive YNAB
+ * full/delta rewrites — same pattern as category colors.
+ */
+async function loadAccountAliasMap(planId) {
+  const accts = await ddb.queryPk(ddb.planPk(planId), 'ACCT#');
+  const map = new Map();
+  for (const a of accts) {
+    const id = a.ynabId || String(a.sk || '').replace(/^ACCT#/, '');
+    if (id && a.alias) map.set(id, String(a.alias));
+  }
+  return map;
+}
+
+/** Last-4 from YNAB account name (often ends with card/account digits). */
+function extractAccountMask(name) {
+  const m = String(name || '').match(/(\d{4})\s*$/);
+  return m ? m[1] : null;
+}
+
+function accountExtra(a, aliasMap) {
+  const alias = aliasMap.get(a.id);
+  const extra = {
+    name: a.name,
+    type: a.type,
+    onBudget: a.on_budget,
+    balance: a.balance,
+    closed: a.closed,
+    deleted: !!a.deleted,
+  };
+  if (alias) extra.alias = alias;
+  return extra;
+}
+
+function mapAccount(i) {
+  const name = i.name || i.payload?.name || '';
+  return {
+    ynabId: i.ynabId,
+    name,
+    type: i.type || i.payload?.type || 'checking',
+    balance: i.balance ?? i.payload?.balance ?? 0,
+    onBudget: i.onBudget ?? i.payload?.on_budget ?? true,
+    closed: !!(i.closed ?? i.payload?.closed ?? false),
+    note: i.payload?.note ?? null,
+    transferPayeeId: i.payload?.transfer_payee_id ?? null,
+    /** User nickname for UI (categorization, filters, transfers). */
+    alias: i.alias || null,
+    /** Last-4 digits when present in the YNAB account name. */
+    mask: extractAccountMask(name),
+    deleted: !!i.deleted,
+    updatedAt: i.updatedAt || 0,
+  };
 }
 
 function categoryColorExtra(c, groupId, colorMap) {
@@ -200,6 +258,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
     }),
   );
 
+  const accountAliasMap = await loadAccountAliasMap(planId);
   for (const a of accountsR.accounts) {
     if (a.deleted) continue;
     items.push(
@@ -209,13 +268,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
         entityType: 'account',
         ynabId: a.id,
         payload: a,
-        extra: {
-          name: a.name,
-          type: a.type,
-          onBudget: a.on_budget,
-          balance: a.balance,
-          closed: a.closed,
-        },
+        extra: accountExtra(a, accountAliasMap),
       }),
     );
   }
@@ -386,6 +439,7 @@ async function deltaPull() {
 
   const accountsR = await ynab.listAccounts(ynabPlanId, last);
   knowledge = Math.max(knowledge, accountsR.serverKnowledge);
+  const accountAliasMap = await loadAccountAliasMap(planId);
   for (const a of accountsR.accounts) {
     items.push(
       entityItem({
@@ -394,14 +448,7 @@ async function deltaPull() {
         entityType: 'account',
         ynabId: a.id,
         payload: a,
-        extra: {
-          name: a.name,
-          type: a.type,
-          onBudget: a.on_budget,
-          balance: a.balance,
-          closed: a.closed,
-          deleted: !!a.deleted,
-        },
+        extra: accountExtra(a, accountAliasMap),
       }),
     );
   }
@@ -807,6 +854,9 @@ function mapTxn(t) {
   }
   const importId = p.import_id || clientId || null;
   if (importId) out.importId = importId;
+  // Bank import payee (parsed; never raw YNAB match-suggestion JSON)
+  const importPayeeName = parseImportPayeeName(p.import_payee_name);
+  if (importPayeeName) out.importPayeeName = importPayeeName;
   // Plaid match + location (optional; stamped by plaidEnrich)
   if (enrich.plaidTransactionId) out.plaidTransactionId = enrich.plaidTransactionId;
   if (enrich.plaidMerchantName) out.plaidMerchantName = enrich.plaidMerchantName;
@@ -920,18 +970,7 @@ async function listChanges(opts = {}) {
     accounts = accts
       .filter(isChanged)
       .filter((a) => (mode === 'full' ? !a.deleted && !a.closed : true))
-      .map((i) => ({
-        ynabId: i.ynabId,
-        name: i.name,
-        type: i.type,
-        balance: i.balance ?? i.payload?.balance ?? 0,
-        onBudget: i.onBudget ?? i.payload?.on_budget ?? true,
-        closed: !!(i.closed ?? i.payload?.closed ?? false),
-        note: i.payload?.note ?? null,
-        transferPayeeId: i.payload?.transfer_payee_id ?? null,
-        deleted: !!i.deleted,
-        updatedAt: i.updatedAt || 0,
-      }));
+      .map((i) => mapAccount(i));
 
     groupsOut = groups
       .filter(isChanged)
@@ -1229,10 +1268,36 @@ async function listInbox() {
     else uncategorized += 1;
 
     const payee = t.payeeId ? payeeById.get(t.payeeId) : null;
+    const transferAcct = t.transferAccountId
+      ? acctById.get(t.transferAccountId)
+      : null;
+    const namedPayee = payee?.name || payee?.payload?.name || null;
+    const transferYnabName =
+      transferAcct?.name || transferAcct?.payload?.name || null;
+    const transferAlias = transferAcct?.alias
+      ? String(transferAcct.alias).trim()
+      : '';
+    const ynabName = acct.name || acct.payload?.name || null;
+    const alias = acct.alias ? String(acct.alias).trim() : '';
+    // Prefer aliases in transfer labels so categorization reads nicknames.
+    const accountsForPayee = [...acctById.values()].map((a) => ({
+      ...a,
+      name: (a.alias && String(a.alias).trim()) || a.name || a.payload?.name,
+    }));
+    const displayPayee = resolveDisplayPayee({
+      payeeName: namedPayee,
+      transferAccountName: transferAlias || transferYnabName,
+      plaidMerchantName: t.plaidMerchantName || null,
+      plaidPfc: t.plaidPfc || null,
+      importPayeeName: t.importPayeeName || null,
+      accounts: accountsForPayee,
+    });
     out.push({
       ...t,
-      accountName: acct.name || acct.payload?.name || null,
-      payeeName: payee?.name || payee?.payload?.name || null,
+      accountName: alias || ynabName,
+      accountAlias: alias || null,
+      accountMask: extractAccountMask(ynabName),
+      payeeName: displayPayee || namedPayee || null,
       reason,
       onBudget,
     });
@@ -1281,6 +1346,35 @@ async function stats() {
   };
 }
 
+/**
+ * Set or clear a user nickname (alias) on a ledger account.
+ * Does not push to YNAB — aliases are R2Finance-only display labels.
+ */
+async function setAccountAlias(ynabId, aliasRaw) {
+  const id = String(ynabId || '').trim();
+  if (!id) {
+    const err = new Error('ynabId required');
+    err.status = 400;
+    throw err;
+  }
+  const sk = `ACCT#${id}`;
+  const existing = await ddb.getItem(ddb.planPk(), sk);
+  if (!existing || existing.deleted) {
+    const err = new Error('account not found');
+    err.status = 404;
+    throw err;
+  }
+  const alias =
+    aliasRaw == null || aliasRaw === ''
+      ? null
+      : String(aliasRaw).trim().slice(0, 80) || null;
+  const next = { ...existing, updatedAt: Date.now() };
+  if (alias) next.alias = alias;
+  else delete next.alias;
+  await ddb.putItem(next);
+  return mapAccount(next);
+}
+
 module.exports = {
   fullImport,
   deltaPull,
@@ -1291,6 +1385,9 @@ module.exports = {
   listInbox,
   listChanges,
   mapTxn,
+  mapAccount,
+  setAccountAlias,
+  extractAccountMask,
   stats,
   uuid,
   tombstoneTxnItem,

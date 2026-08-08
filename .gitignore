@@ -8,3 +8,7 @@ coverage/
 .api-endpoint
 *.zip
 node_modules/
+
+# local amazon auth experiments (do not ship until working)
+scripts/local/
+
