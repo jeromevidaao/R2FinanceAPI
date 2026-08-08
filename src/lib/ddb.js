@@ -90,11 +90,21 @@ async function queryPendingPush(limit = 50) {
 }
 
 async function markSynced(pk, sk, extra = {}) {
+  const now = Date.now();
   const names = { '#ss': 'syncStatus' };
-  const values = { ':s': 'SYNCED', ':u': Date.now() };
-  let update = 'SET #ss = :s, updatedAt = :u REMOVE gsi2pk, gsi2sk';
+  // lastPushedAt: when this row was successfully written to YNAB (outbound).
+  // Callers can override via extra; default is "now" so category/approve/create
+  // pushes are visible on Reflect without a separate audit table.
+  const values = {
+    ':s': 'SYNCED',
+    ':u': now,
+    ':lp': extra.lastPushedAt != null ? extra.lastPushedAt : now,
+  };
+  let update =
+    'SET #ss = :s, updatedAt = :u, lastPushedAt = :lp REMOVE gsi2pk, gsi2sk';
   let i = 0;
   for (const [k, v] of Object.entries(extra)) {
+    if (k === 'lastPushedAt') continue; // already applied as :lp
     i += 1;
     names[`#k${i}`] = k;
     values[`:v${i}`] = v;

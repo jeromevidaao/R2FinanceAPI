@@ -347,6 +347,16 @@ exports.handler = async (event) => {
       let push;
       if (body.push !== false) {
         push = await sync.pushPending({ limit: 10 });
+        console.log(
+          JSON.stringify({
+            msg: 'categorize→ynab',
+            ynabTxnId: body.ynabTxnId,
+            categoryYnabId: body.categoryYnabId,
+            pushed: push?.pushed ?? 0,
+            failed: push?.failed ?? 0,
+            results: (push?.results || []).slice(0, 5),
+          }),
+        );
         const failedForTxn = (push?.results || []).find(
           (r) =>
             r &&

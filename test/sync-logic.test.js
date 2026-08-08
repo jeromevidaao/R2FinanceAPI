@@ -98,6 +98,22 @@ describe('mapTxn stable client id', () => {
     assert.equal('subtransactions' in mapped, false);
     assert.equal('memo' in mapped, false);
   });
+
+  it('exposes syncStatus + lastPushedAt for outbound YNAB visibility', () => {
+    const { mapTxn } = require('../src/lib/sync');
+    const mapped = mapTxn({
+      sk: 'TXN#pushed-1',
+      ynabId: 'pushed-1',
+      accountId: 'a',
+      date: '2026-08-01',
+      amount: -500,
+      syncStatus: 'SYNCED',
+      lastPushedAt: 1700000001000,
+      payload: {},
+    });
+    assert.equal(mapped.syncStatus, 'SYNCED');
+    assert.equal(mapped.lastPushedAt, 1700000001000);
+  });
 });
 
 describe('listChanges export', () => {

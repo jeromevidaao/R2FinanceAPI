@@ -642,12 +642,14 @@ async function pushPending({ limit = 40 } = {}) {
           import_id: payload.import_id || item.clientId || undefined,
         });
         const newYnabId = created.id || created.transaction?.id;
+        const pushedAt = Date.now();
         await ddb.putItem({
           ...item,
           ynabId: newYnabId,
           deviceCreate: false,
           syncStatus: 'SYNCED',
-          updatedAt: Date.now(),
+          updatedAt: pushedAt,
+          lastPushedAt: pushedAt,
           payload: {
             ...payload,
             id: newYnabId,
@@ -655,8 +657,12 @@ async function pushPending({ limit = 40 } = {}) {
           gsi2pk: undefined,
           gsi2sk: undefined,
         });
-        // Clear GSI pending keys
-        await ddb.markSynced(item.pk, item.sk, { ynabId: newYnabId, deviceCreate: false });
+        // Clear GSI pending keys + stamp lastPushedAt
+        await ddb.markSynced(item.pk, item.sk, {
+          ynabId: newYnabId,
+          deviceCreate: false,
+          lastPushedAt: pushedAt,
+        });
         results.push({ sk: item.sk, ok: true, created: true, ynabTxnId: newYnabId });
         continue;
       }
@@ -673,7 +679,7 @@ async function pushPending({ limit = 40 } = {}) {
         payee_id: payeeId,
       });
       await ddb.markSynced(item.pk, item.sk);
-      results.push({ sk: item.sk, ok: true, ynabTxnId });
+      results.push({ sk: item.sk, ok: true, ynabTxnId, updated: true });
     } catch (e) {
       results.push({ sk: item.sk, ok: false, error: e.message, status: e.status });
     }
@@ -783,6 +789,9 @@ function mapTxn(t) {
     deleted: !!(t.deleted || p.deleted),
     updatedAt: t.updatedAt || 0,
   };
+  // Sync bridge metadata (outbound to YNAB).
+  if (t.syncStatus) out.syncStatus = t.syncStatus;
+  if (t.lastPushedAt) out.lastPushedAt = t.lastPushedAt;
   // Optional scalars — omit null/empty to shrink JSON.
   if (clientId) out.clientId = clientId;
   const payeeId = t.payeeId ?? p.payee_id ?? null;
