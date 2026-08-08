@@ -1,11 +1,15 @@
 'use strict';
 
+const zlib = require('zlib');
 const sync = require('../lib/sync');
 const ddb = require('../lib/ddb');
 const auth = require('../lib/auth');
 const connectors = require('../lib/connectors');
 const fcm = require('../lib/fcm');
 const { ledgerPlanId } = require('../lib/config');
+
+/** Gzip JSON bodies larger than this (bytes) to stay under Lambda 6MB response cap. */
+const GZIP_THRESHOLD = 200_000;
 
 /**
  * Browser origins allowed for CORS. Non-browser clients (Android) send no
@@ -56,17 +60,33 @@ function corsOrigin(event) {
 }
 
 function json(statusCode, body, event = null) {
+  const headers = {
+    'content-type': 'application/json',
+    'access-control-allow-origin': corsOrigin(event),
+    'access-control-allow-headers':
+      'authorization,content-type,x-r2finance-client,x-client,accept-encoding',
+    'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
+    vary: 'Origin, Accept-Encoding',
+  };
+  const raw = JSON.stringify(body == null ? {} : body);
+  // Compress large payloads so full ledger sync stays under Lambda's 6MB limit.
+  // Browsers (fetch) and OkHttp auto-decompress Content-Encoding: gzip.
+  if (raw.length >= GZIP_THRESHOLD) {
+    const gz = zlib.gzipSync(Buffer.from(raw, 'utf8'), { level: 6 });
+    return {
+      statusCode,
+      headers: {
+        ...headers,
+        'content-encoding': 'gzip',
+      },
+      isBase64Encoded: true,
+      body: gz.toString('base64'),
+    };
+  }
   return {
     statusCode,
-    headers: {
-      'content-type': 'application/json',
-      'access-control-allow-origin': corsOrigin(event),
-      'access-control-allow-headers':
-        'authorization,content-type,x-r2finance-client,x-client',
-      'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
-      vary: 'Origin',
-    },
-    body: JSON.stringify(body),
+    headers,
+    body: raw,
   };
 }
 
@@ -295,7 +315,7 @@ exports.handler = async (event) => {
     }
 
     // Local-first clients: full snapshot or incremental changes since cursor.
-    // GET /v1/sync/changes?since=<epoch_ms>&full=0|1
+    // GET /v1/sync/changes?since=<epoch_ms>&full=0|1&txnOffset=0&txnLimit=2500
     if (method === 'GET' && path === '/v1/sync/changes') {
       const qs = event?.queryStringParameters || {};
       return respond(
@@ -303,6 +323,8 @@ exports.handler = async (event) => {
         await sync.listChanges({
           since: qs.since,
           full: qs.full,
+          txnOffset: qs.txnOffset,
+          txnLimit: qs.txnLimit,
         }),
       );
     }

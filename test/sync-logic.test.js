@@ -80,6 +80,24 @@ describe('mapTxn stable client id', () => {
     assert.equal(mapped.deleted, true);
     assert.equal(mapped.updatedAt, 1700000000000);
   });
+
+  it('omits null optional plaid fields to keep full sync under 6MB', () => {
+    const { mapTxn } = require('../src/lib/sync');
+    const mapped = mapTxn({
+      sk: 'TXN#lean',
+      ynabId: 'lean',
+      accountId: 'a',
+      date: '2026-01-01',
+      amount: -100,
+      payload: {},
+    });
+    assert.equal(mapped.ynabId, 'lean');
+    assert.equal(mapped.accountId, 'a');
+    assert.equal('plaidTransactionId' in mapped, false);
+    assert.equal('locationDisplay' in mapped, false);
+    assert.equal('subtransactions' in mapped, false);
+    assert.equal('memo' in mapped, false);
+  });
 });
 
 describe('listChanges export', () => {

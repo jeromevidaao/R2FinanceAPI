@@ -761,6 +761,9 @@ async function approveTransaction({ ynabTxnId }) {
  * Map a DDB transaction row to the public API shape.
  * `id` is the stable client key (device clientId or YNAB id) — never changes after create.
  * `ynabId` is the real YNAB id once known (null for device-only until push).
+ *
+ * Optional fields that are null/empty are omitted so full snapshots stay under
+ * the Lambda 6MB response limit (~7k+ txns with Plaid enrich fields).
  */
 function mapTxn(t) {
   const p = t.payload || {};
@@ -769,61 +772,93 @@ function mapTxn(t) {
   const ynabId = t.ynabId || p.id || null;
   const stableId = clientId || ynabId || skId;
   const enrich = pickEnrichment(t);
-  return {
+  const out = {
     id: stableId,
-    clientId,
     ynabId: ynabId || stableId,
     accountId: t.accountId || p.account_id,
     date: t.date || p.date,
     amount: t.amount ?? p.amount,
-    payeeId: t.payeeId ?? p.payee_id ?? null,
-    categoryId: t.categoryId ?? p.category_id ?? null,
-    memo: t.memo ?? p.memo ?? null,
     cleared: t.cleared || p.cleared || 'uncleared',
     approved: t.approved ?? p.approved ?? true,
-    flagColor: p.flag_color || null,
-    transferAccountId: p.transfer_account_id || null,
-    transferTransactionId: p.transfer_transaction_id || null,
-    importId: p.import_id || clientId || null,
     deleted: !!(t.deleted || p.deleted),
     updatedAt: t.updatedAt || 0,
-    // Plaid match + location (optional; stamped by plaidEnrich)
-    plaidTransactionId: enrich.plaidTransactionId || null,
-    plaidMerchantName: enrich.plaidMerchantName || null,
-    plaidMerchantEntityId: enrich.plaidMerchantEntityId || null,
-    plaidPaymentChannel: enrich.plaidPaymentChannel || null,
-    plaidPfc: enrich.plaidPfc || null,
-    matchTier: enrich.matchTier || null,
-    matchConfidence: enrich.matchConfidence ?? null,
-    location: enrich.location || null,
-    locationSource: enrich.locationSource || null,
-    locationConfidence: enrich.locationConfidence ?? null,
-    /** UI string: "City, ST" (US) or "City, Country" (intl). */
-    locationDisplay: enrich.locationDisplay || null,
-    enrichedAt: enrich.enrichedAt || null,
-    subtransactions: (p.subtransactions || []).map((s) => ({
-      ynabId: s.id,
-      amount: s.amount,
-      payeeId: s.payee_id || null,
-      categoryId: s.category_id || null,
-      memo: s.memo || null,
-      transferAccountId: s.transfer_account_id || null,
-    })),
   };
+  // Optional scalars — omit null/empty to shrink JSON.
+  if (clientId) out.clientId = clientId;
+  const payeeId = t.payeeId ?? p.payee_id ?? null;
+  if (payeeId) out.payeeId = payeeId;
+  const categoryId = t.categoryId ?? p.category_id ?? null;
+  if (categoryId) out.categoryId = categoryId;
+  const memo = t.memo ?? p.memo ?? null;
+  if (memo) out.memo = memo;
+  if (p.flag_color) out.flagColor = p.flag_color;
+  if (p.transfer_account_id) out.transferAccountId = p.transfer_account_id;
+  if (p.transfer_transaction_id) {
+    out.transferTransactionId = p.transfer_transaction_id;
+  }
+  const importId = p.import_id || clientId || null;
+  if (importId) out.importId = importId;
+  // Plaid match + location (optional; stamped by plaidEnrich)
+  if (enrich.plaidTransactionId) out.plaidTransactionId = enrich.plaidTransactionId;
+  if (enrich.plaidMerchantName) out.plaidMerchantName = enrich.plaidMerchantName;
+  if (enrich.plaidMerchantEntityId) {
+    out.plaidMerchantEntityId = enrich.plaidMerchantEntityId;
+  }
+  if (enrich.plaidPaymentChannel) {
+    out.plaidPaymentChannel = enrich.plaidPaymentChannel;
+  }
+  if (enrich.plaidPfc) out.plaidPfc = enrich.plaidPfc;
+  if (enrich.matchTier) out.matchTier = enrich.matchTier;
+  if (enrich.matchConfidence != null) out.matchConfidence = enrich.matchConfidence;
+  if (enrich.location) out.location = enrich.location;
+  if (enrich.locationSource) out.locationSource = enrich.locationSource;
+  if (enrich.locationConfidence != null) {
+    out.locationConfidence = enrich.locationConfidence;
+  }
+  if (enrich.locationDisplay) out.locationDisplay = enrich.locationDisplay;
+  if (enrich.enrichedAt) out.enrichedAt = enrich.enrichedAt;
+  const subs = (p.subtransactions || [])
+    .map((s) => {
+      const sub = { amount: s.amount };
+      if (s.id) sub.ynabId = s.id;
+      if (s.payee_id) sub.payeeId = s.payee_id;
+      if (s.category_id) sub.categoryId = s.category_id;
+      if (s.memo) sub.memo = s.memo;
+      if (s.transfer_account_id) sub.transferAccountId = s.transfer_account_id;
+      return sub;
+    })
+    .filter((s) => s.amount != null);
+  if (subs.length) out.subtransactions = subs;
+  return out;
 }
+
+/** Default page size for full snapshots — keeps each response well under 6MB. */
+const DEFAULT_TXN_PAGE = 2500;
+/** Hard ceiling so a malicious/huge limit cannot blow the Lambda response. */
+const MAX_TXN_PAGE = 4000;
 
 /**
  * Local-first client sync: full snapshot or incremental changes since cursor.
  *
- * Query: GET /v1/sync/changes?since=<epoch_ms>&full=0|1
+ * Query: GET /v1/sync/changes?since=<epoch_ms>&full=0|1&txnOffset=0&txnLimit=2500
  *
  * - No since / since=0 / full=1 → mode "full" (live rows only; no tombstones)
  * - since>0 → mode "delta" (rows with updatedAt > since, including deleted:true)
+ * - Transactions are paged (`txnOffset` / `txnLimit`). Meta entities (accounts,
+ *   groups, categories, payees, plan) are only included on the first page
+ *   (`txnOffset=0`) so follow-up pages stay small.
+ * - When `hasMore` is true, clients must request `nextTxnOffset` until done
+ *   before advancing their local cursor.
  *
  * Clients store `cursor` (serverTime) and pass it as the next `since`.
  * HTTP payload stays small on day-to-day opens; occasional full resync heals drift.
  *
- * @param {{ since?: number|string, full?: boolean|string|number }} [opts]
+ * @param {{
+ *   since?: number|string,
+ *   full?: boolean|string|number,
+ *   txnOffset?: number|string,
+ *   txnLimit?: number|string,
+ * }} [opts]
  */
 async function listChanges(opts = {}) {
   const serverTime = Date.now();
@@ -835,96 +870,123 @@ async function listChanges(opts = {}) {
     opts.full === 'true';
   const mode = forceFull || !sinceMs ? 'full' : 'delta';
   const planId = ledgerPlanId;
+  const txnOffset = Math.max(0, Math.floor(Number(opts.txnOffset) || 0));
+  let txnLimit = Math.floor(Number(opts.txnLimit) || 0);
+  if (!txnLimit || txnLimit < 1) {
+    // Full dumps always page; delta defaults high but still capped.
+    txnLimit = mode === 'full' ? DEFAULT_TXN_PAGE : MAX_TXN_PAGE;
+  }
+  txnLimit = Math.min(MAX_TXN_PAGE, Math.max(1, txnLimit));
+  const includeMeta = txnOffset === 0;
 
   const [meta, accts, groups, cats, payees, txns] = await Promise.all([
-    ddb.getItem(ddb.planPk(planId), 'META'),
-    ddb.queryPk(ddb.planPk(planId), 'ACCT#'),
-    ddb.queryPk(ddb.planPk(planId), 'CGRP#'),
-    ddb.queryPk(ddb.planPk(planId), 'CAT#'),
-    ddb.queryPk(ddb.planPk(planId), 'PAYEE#'),
+    includeMeta ? ddb.getItem(ddb.planPk(planId), 'META') : Promise.resolve(null),
+    includeMeta ? ddb.queryPk(ddb.planPk(planId), 'ACCT#') : Promise.resolve([]),
+    includeMeta ? ddb.queryPk(ddb.planPk(planId), 'CGRP#') : Promise.resolve([]),
+    includeMeta ? ddb.queryPk(ddb.planPk(planId), 'CAT#') : Promise.resolve([]),
+    includeMeta ? ddb.queryPk(ddb.planPk(planId), 'PAYEE#') : Promise.resolve([]),
     ddb.queryPk(ddb.planPk(planId), 'TXN#'),
   ]);
 
-  const plan = {
-    name: meta?.payload?.name || meta?.name || 'Plan',
-    ynabPlanId: meta?.ynabPlanId || meta?.payload?.ynabPlanId,
-    currency: meta?.payload?.currency || 'USD',
-    serverKnowledge: meta?.serverKnowledge ?? 0,
-  };
+  const plan = includeMeta
+    ? {
+        name: meta?.payload?.name || meta?.name || 'Plan',
+        ynabPlanId: meta?.ynabPlanId || meta?.payload?.ynabPlanId,
+        currency: meta?.payload?.currency || 'USD',
+        serverKnowledge: meta?.serverKnowledge ?? 0,
+      }
+    : null;
 
   const isChanged = (row) => {
     if (mode === 'full') return true;
     return (Number(row.updatedAt) || 0) > sinceMs;
   };
 
-  const accounts = accts
-    .filter(isChanged)
-    .filter((a) => (mode === 'full' ? !a.deleted && !a.closed : true))
-    .map((i) => ({
-      ynabId: i.ynabId,
-      name: i.name,
-      type: i.type,
-      balance: i.balance ?? i.payload?.balance ?? 0,
-      onBudget: i.onBudget ?? i.payload?.on_budget ?? true,
-      closed: !!(i.closed ?? i.payload?.closed ?? false),
-      note: i.payload?.note ?? null,
-      transferPayeeId: i.payload?.transfer_payee_id ?? null,
-      deleted: !!i.deleted,
-      updatedAt: i.updatedAt || 0,
-    }));
+  let accounts = [];
+  let groupsOut = [];
+  let categories = [];
+  let payeesOut = [];
 
-  const groupsOut = groups
-    .filter(isChanged)
-    .filter((g) => (mode === 'full' ? !g.deleted : true))
-    .map((g) => ({
-      ynabId: g.ynabId,
-      name: g.name,
-      hidden: g.hidden ?? false,
-      deleted: !!g.deleted,
-      updatedAt: g.updatedAt || 0,
-    }));
+  if (includeMeta) {
+    accounts = accts
+      .filter(isChanged)
+      .filter((a) => (mode === 'full' ? !a.deleted && !a.closed : true))
+      .map((i) => ({
+        ynabId: i.ynabId,
+        name: i.name,
+        type: i.type,
+        balance: i.balance ?? i.payload?.balance ?? 0,
+        onBudget: i.onBudget ?? i.payload?.on_budget ?? true,
+        closed: !!(i.closed ?? i.payload?.closed ?? false),
+        note: i.payload?.note ?? null,
+        transferPayeeId: i.payload?.transfer_payee_id ?? null,
+        deleted: !!i.deleted,
+        updatedAt: i.updatedAt || 0,
+      }));
 
-  const { colorForCategory } = require('./categoryColors');
-  const categories = cats
-    .filter(isChanged)
-    .filter((c) => (mode === 'full' ? !c.deleted : true))
-    .map((c) => {
-      let color = c.color;
-      if (!color) {
-        color = colorForCategory({ name: c.name, ynabId: c.ynabId });
-      }
-      return {
-        ynabId: c.ynabId,
-        name: c.name,
-        categoryGroupId: c.categoryGroupId,
-        hidden: c.hidden ?? false,
-        color,
-        deleted: !!c.deleted,
-        updatedAt: c.updatedAt || 0,
-      };
-    });
+    groupsOut = groups
+      .filter(isChanged)
+      .filter((g) => (mode === 'full' ? !g.deleted : true))
+      .map((g) => ({
+        ynabId: g.ynabId,
+        name: g.name,
+        hidden: g.hidden ?? false,
+        deleted: !!g.deleted,
+        updatedAt: g.updatedAt || 0,
+      }));
 
-  const payeesOut = payees
-    .filter(isChanged)
-    .filter((p) => (mode === 'full' ? !p.deleted : true))
-    .map((p) => ({
-      ynabId: p.ynabId,
-      name: p.name,
-      transferAccountId:
-        p.transferAccountId ?? p.payload?.transfer_account_id ?? null,
-      deleted: !!p.deleted,
-      updatedAt: p.updatedAt || 0,
-    }));
+    categories = cats
+      .filter(isChanged)
+      .filter((c) => (mode === 'full' ? !c.deleted : true))
+      .map((c) => {
+        let color = c.color;
+        if (!color) {
+          color = colorForCategory({ name: c.name, ynabId: c.ynabId });
+        }
+        return {
+          ynabId: c.ynabId,
+          name: c.name,
+          categoryGroupId: c.categoryGroupId,
+          hidden: c.hidden ?? false,
+          color,
+          deleted: !!c.deleted,
+          updatedAt: c.updatedAt || 0,
+        };
+      });
 
-  const transactions = txns
+    payeesOut = payees
+      .filter(isChanged)
+      .filter((p) => (mode === 'full' ? !p.deleted : true))
+      .map((p) => ({
+        ynabId: p.ynabId,
+        name: p.name,
+        transferAccountId:
+          p.transferAccountId ?? p.payload?.transfer_account_id ?? null,
+        deleted: !!p.deleted,
+        updatedAt: p.updatedAt || 0,
+      }));
+  }
+
+  // Stable sort so pages never re-shuffle between requests.
+  const filteredTxns = txns
     .filter(isChanged)
     .filter((t) => (mode === 'full' ? !t.deleted : true))
-    .map((t) => mapTxn(t));
+    .sort((a, b) => {
+      const ka = String(a.sk || a.ynabId || a.clientId || '');
+      const kb = String(b.sk || b.ynabId || b.clientId || '');
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+  const txnTotal = filteredTxns.length;
+  const pageRows = filteredTxns.slice(txnOffset, txnOffset + txnLimit);
+  const transactions = pageRows.map((t) => mapTxn(t));
+  const nextTxnOffset = txnOffset + transactions.length;
+  const hasMore = nextTxnOffset < txnTotal;
 
   return {
     mode,
     serverTime,
-    cursor: serverTime,
+    // Only advance client cursor once the full page set is consumed.
+    cursor: hasMore ? sinceMs : serverTime,
     since: sinceMs,
     plan,
     accounts,
@@ -932,12 +994,18 @@ async function listChanges(opts = {}) {
     categories,
     payees: payeesOut,
     transactions,
+    hasMore,
+    txnOffset,
+    nextTxnOffset,
+    txnLimit,
+    txnTotal,
     counts: {
       accounts: accounts.length,
       groups: groupsOut.length,
       categories: categories.length,
       payees: payeesOut.length,
       transactions: transactions.length,
+      txnTotal,
     },
   };
 }
