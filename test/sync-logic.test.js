@@ -260,3 +260,182 @@ describe('matchedCounterpartTombstones', () => {
     assert.equal(item.sk, 'TXN#x');
   });
 });
+
+describe('ghostTransferImportTombstones', () => {
+  const {
+    ghostTransferImportTombstones,
+    dateDiffDays,
+  } = require('../src/lib/sync');
+
+  const checkin = 'acct-checkin-6022';
+  const freedom = 'acct-freedom-6553';
+  const amount = -711820; // YNAB milliunits (−$711.82)
+
+  function transferPair(date = '2026-08-07') {
+    return [
+      {
+        id: 'xfer-out',
+        account_id: checkin,
+        date,
+        amount,
+        approved: true,
+        category_id: null,
+        transfer_account_id: freedom,
+        transfer_transaction_id: 'xfer-in',
+        payee_name: 'Transfer : Family Freedom 6553',
+      },
+      {
+        id: 'xfer-in',
+        account_id: freedom,
+        date,
+        amount: -amount,
+        approved: true,
+        category_id: null,
+        transfer_account_id: checkin,
+        transfer_transaction_id: 'xfer-out',
+        payee_name: 'Transfer : Family Checkin 6022',
+      },
+    ];
+  }
+
+  it('hides Category Needed bank import that duplicates a transfer pair', () => {
+    const ghost = {
+      id: 'import-ghost',
+      account_id: checkin,
+      date: '2026-08-07',
+      amount,
+      approved: false,
+      category_id: null,
+      import_id: 'YNAB:…:2026-08-07:1',
+      payee_name: null,
+    };
+    const items = ghostTransferImportTombstones('default', [
+      ghost,
+      ...transferPair(),
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].sk, 'TXN#import-ghost');
+    assert.equal(items[0].deleted, true);
+    assert.equal(items[0].approved, true);
+    assert.equal(items[0].payload._tombstone, 'ghost_transfer_import');
+    assert.equal(items[0].payload._ghost_of_transfer_id, 'xfer-out');
+    // Unapproved → queue auto-approve to YNAB
+    assert.equal(items[0].syncStatus, 'PENDING_PUSH');
+    assert.equal(items[0].gsi2pk, 'PENDING_PUSH');
+  });
+
+  it('does not PENDING_PUSH when ghost is already approved (just hide)', () => {
+    const ghost = {
+      id: 'import-approved-ghost',
+      account_id: checkin,
+      date: '2026-08-07',
+      amount,
+      approved: true,
+      category_id: null, // still Category Needed
+    };
+    const items = ghostTransferImportTombstones('default', [
+      ghost,
+      ...transferPair(),
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].deleted, true);
+    assert.notEqual(items[0].syncStatus, 'PENDING_PUSH');
+    assert.equal(items[0].gsi2pk, undefined);
+  });
+
+  it('does not hide a categorized approved spend of the same amount', () => {
+    const realSpend = {
+      id: 'real-spend',
+      account_id: checkin,
+      date: '2026-08-07',
+      amount,
+      approved: true,
+      category_id: 'cat-groceries',
+    };
+    const items = ghostTransferImportTombstones('default', [
+      realSpend,
+      ...transferPair(),
+    ]);
+    assert.equal(items.length, 0);
+  });
+
+  it('allows ±1 day bank date lag', () => {
+    const ghost = {
+      id: 'import-lag',
+      account_id: checkin,
+      date: '2026-08-08',
+      amount,
+      approved: false,
+      category_id: null,
+    };
+    const items = ghostTransferImportTombstones('default', [
+      ghost,
+      ...transferPair('2026-08-07'),
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].ynabId, 'import-lag');
+  });
+
+  it('ignores date gaps larger than 1 day', () => {
+    const ghost = {
+      id: 'import-far',
+      account_id: checkin,
+      date: '2026-08-01',
+      amount,
+      approved: false,
+      category_id: null,
+    };
+    const items = ghostTransferImportTombstones('default', [
+      ghost,
+      ...transferPair('2026-08-07'),
+    ]);
+    assert.equal(items.length, 0);
+  });
+
+  it('requires a live opposite-amount pair when transfer_transaction_id is set', () => {
+    const ghost = {
+      id: 'import-no-pair',
+      account_id: checkin,
+      date: '2026-08-07',
+      amount,
+      approved: false,
+      category_id: null,
+    };
+    const items = ghostTransferImportTombstones('default', [
+      ghost,
+      {
+        id: 'orphan-xfer',
+        account_id: checkin,
+        date: '2026-08-07',
+        amount,
+        approved: true,
+        transfer_account_id: freedom,
+        transfer_transaction_id: 'missing-other-side',
+      },
+    ]);
+    assert.equal(items.length, 0);
+  });
+
+  it('skips pending-push ghost keys', () => {
+    const ghost = {
+      id: 'import-pending',
+      account_id: checkin,
+      date: '2026-08-07',
+      amount,
+      approved: false,
+      category_id: null,
+    };
+    const items = ghostTransferImportTombstones(
+      'default',
+      [ghost, ...transferPair()],
+      new Set(['TXN#import-pending']),
+    );
+    assert.equal(items.length, 0);
+  });
+
+  it('dateDiffDays handles ISO dates', () => {
+    assert.equal(dateDiffDays('2026-08-07', '2026-08-08'), 1);
+    assert.equal(dateDiffDays('2026-08-07', '2026-08-07'), 0);
+    assert.equal(dateDiffDays(null, '2026-08-07'), Infinity);
+  });
+});

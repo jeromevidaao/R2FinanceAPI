@@ -127,7 +127,7 @@ function entityItem({
  * from the live list (404) while the survivor keeps matched_transaction_id.
  * Without this tombstone, inbox double-counts both sides.
  */
-function tombstoneTxnItem(planId, ynabId, accountId) {
+function tombstoneTxnItem(planId, ynabId, accountId, reason = 'matched_or_missing') {
   if (!ynabId) return null;
   return entityItem({
     planId,
@@ -138,7 +138,7 @@ function tombstoneTxnItem(planId, ynabId, accountId) {
       id: ynabId,
       deleted: true,
       account_id: accountId || null,
-      _tombstone: 'matched_or_missing',
+      _tombstone: reason,
     },
     extra: {
       deleted: true,
@@ -176,6 +176,111 @@ function matchedCounterpartTombstones(planId, transactions, pendingSk = new Set(
     seen.add(mid);
     const item = tombstoneTxnItem(planId, mid, t.account_id);
     if (item) out.push(item);
+  }
+  return out;
+}
+
+/** Absolute day difference between two ISO date strings (YYYY-MM-DD). */
+function dateDiffDays(a, b) {
+  if (!a || !b) return Infinity;
+  const ta = Date.parse(`${a}T00:00:00Z`);
+  const tb = Date.parse(`${b}T00:00:00Z`);
+  if (Number.isNaN(ta) || Number.isNaN(tb)) return Infinity;
+  return Math.abs(Math.round((ta - tb) / 86400000));
+}
+
+/**
+ * YNAB sometimes leaves a bank-import "Category Needed / Needs approval" row
+ * on the source account *after* a real transfer pair already exists:
+ *
+ *   Checkin  −$711  Category Needed  (ghost import)
+ *   Checkin  −$711  Transfer : Freedom  (real)
+ *   Freedom  +$711  Transfer : Checkin  (real)
+ *
+ * A transfer pair is only two rows. The third is a YNAB import bug — hide it
+ * in R2Finance (soft-delete) and auto-approve it so YNAB's needs-attention
+ * queue stays consistent.
+ *
+ * Match rules (all required):
+ * - ghost is live, not a transfer, same account + amount as a live transfer
+ * - dates within ±1 day (bank lag)
+ * - ghost is unapproved and/or uncategorized (needs-attention shape)
+ * - transfer has transfer_account_id; when transfer_transaction_id is set,
+ *   the other side must be live with opposite amount (real pair)
+ *
+ * @param {string} planId
+ * @param {Array<object>} transactions YNAB-shaped txn list
+ * @param {Set<string>} [pendingSk] TXN#… keys to leave alone
+ * @returns {object[]} DDB put items (deleted + approved; PENDING_PUSH if unapproved)
+ */
+function ghostTransferImportTombstones(planId, transactions, pendingSk = new Set()) {
+  const live = (transactions || []).filter((t) => t && t.id && !t.deleted);
+  const byId = new Map(live.map((t) => [t.id, t]));
+
+  /** @type {object[]} */
+  const transfers = [];
+  for (const t of live) {
+    if (!t.transfer_account_id) continue;
+    if (t.transfer_transaction_id) {
+      const other = byId.get(t.transfer_transaction_id);
+      if (!other || other.deleted) continue;
+      if (other.amount !== -t.amount) continue;
+    }
+    transfers.push(t);
+  }
+  if (!transfers.length) return [];
+
+  const out = [];
+  const seen = new Set();
+  for (const tr of transfers) {
+    for (const g of live) {
+      if (!g || !g.id || g.id === tr.id) continue;
+      if (g.transfer_account_id) continue;
+      if (g.account_id !== tr.account_id) continue;
+      if (g.amount !== tr.amount) continue;
+      if (dateDiffDays(g.date, tr.date) > 1) continue;
+      // Only hide needs-attention-shaped imports (Category Needed / unapproved).
+      // Leave alone a fully categorized+approved same-amount spend.
+      const catMissing = g.category_id == null || g.category_id === '';
+      if (g.approved && !catMissing) continue;
+      if (seen.has(g.id)) continue;
+      const sk = `TXN#${g.id}`;
+      if (pendingSk.has(sk)) continue;
+      seen.add(g.id);
+
+      const item = tombstoneTxnItem(
+        planId,
+        g.id,
+        g.account_id || tr.account_id,
+        'ghost_transfer_import',
+      );
+      if (!item) continue;
+      // Preserve identity fields so clients/debugging can see what we hid.
+      item.date = g.date;
+      item.amount = g.amount;
+      item.payload = {
+        ...item.payload,
+        date: g.date,
+        amount: g.amount,
+        payee_id: g.payee_id ?? null,
+        category_id: g.category_id ?? null,
+        import_id: g.import_id ?? null,
+        approved: true,
+        cleared: g.cleared || 'uncleared',
+        memo: g.memo ?? null,
+        payee_name: g.payee_name ?? null,
+        import_payee_name: g.import_payee_name ?? null,
+        _ghost_of_transfer_id: tr.id,
+      };
+      // Auto-approve in YNAB when the ghost still needs approval.
+      if (g.approved === false) {
+        const now = item.updatedAt || Date.now();
+        item.syncStatus = 'PENDING_PUSH';
+        item.gsi2pk = 'PENDING_PUSH';
+        item.gsi2sk = `${String(now).padStart(15, '0')}#${sk}`;
+      }
+      out.push(item);
+    }
   }
   return out;
 }
@@ -327,8 +432,14 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
     if (Object.keys(e).length) enrichBySk.set(row.sk, e);
   }
 
+  // Hide YNAB's extra bank-import row when a real transfer pair already exists.
+  // Written instead of the live row (same sk) so BatchWrite never double-puts.
+  const ghostItems = ghostTransferImportTombstones(planId, txnsR.transactions);
+  const ghostIds = new Set(ghostItems.map((i) => i.ynabId).filter(Boolean));
+
   for (const t of txnsR.transactions) {
     const sk = `TXN#${t.id}`;
+    if (ghostIds.has(t.id)) continue;
     const kept = enrichBySk.get(sk) || {};
     if (t.deleted) {
       items.push(
@@ -368,6 +479,8 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
 
   // Matched imports: survivor stays; counterpart id is gone from YNAB — tombstone it.
   items.push(...matchedCounterpartTombstones(planId, txnsR.transactions));
+  // Ghost transfer imports: soft-delete + auto-approve (see ghostTransferImportTombstones).
+  items.push(...ghostItems);
 
   for (const s of schedR.scheduled) {
     if (s.deleted) continue;
@@ -526,11 +639,24 @@ async function deltaPull() {
     if (Object.keys(e).length) enrichBySk.set(row.sk, e);
   }
 
+  // Hide YNAB's extra bank-import when a real transfer pair already exists.
+  const ghostItems = ghostTransferImportTombstones(
+    planId,
+    txnsR.transactions,
+    pendingSk,
+  );
+  const ghostIds = new Set(ghostItems.map((i) => i.ynabId).filter(Boolean));
+
   let skippedPending = 0;
+  let ghostHidden = 0;
   for (const t of txnsR.transactions) {
     const sk = `TXN#${t.id}`;
     if (pendingSk.has(sk)) {
       skippedPending += 1;
+      continue;
+    }
+    if (ghostIds.has(t.id)) {
+      ghostHidden += 1;
       continue;
     }
     const kept = enrichBySk.get(sk) || {};
@@ -563,6 +689,8 @@ async function deltaPull() {
   items.push(
     ...matchedCounterpartTombstones(planId, txnsR.transactions, pendingSk),
   );
+  // Ghost transfer imports: soft-delete + auto-approve unapproved ones.
+  items.push(...ghostItems);
 
   const schedR = await ynab.listScheduled(ynabPlanId, last);
   knowledge = Math.max(knowledge, schedR.serverKnowledge);
@@ -618,6 +746,7 @@ async function deltaPull() {
     serverKnowledge: knowledge,
     itemsUpserted: items.length,
     skippedPendingPush: skippedPending,
+    ghostTransferImportsHidden: ghostHidden || ghostItems.length,
     plaidEnrich,
   };
 }
@@ -1392,5 +1521,7 @@ module.exports = {
   uuid,
   tombstoneTxnItem,
   matchedCounterpartTombstones,
+  ghostTransferImportTombstones,
+  dateDiffDays,
   reconcileMissingYnabTxns,
 };
