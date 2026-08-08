@@ -32,6 +32,16 @@ describe('formatLocationDisplay', () => {
       'Kirkland, WA',
     );
   });
+  it('abbreviates full US state names', () => {
+    assert.equal(
+      formatLocationDisplay({
+        city: 'Bellevue',
+        region: 'Washington',
+        country: 'US',
+      }),
+      'Bellevue, WA',
+    );
+  });
   it('formats non-US as city, country', () => {
     assert.equal(
       formatLocationDisplay({
@@ -283,5 +293,12 @@ describe('merchantLocation helpers', () => {
       { merchant: 'X' },
     );
     assert.equal(lookupEntity(cache, 'e1'), null);
+  });
+
+  it('detects foreign place hints for travel merchants', () => {
+    const { placeHintFromName } = require('../src/lib/merchantLocation');
+    assert.equal(placeHintFromName('Singapore Food Street').country, 'SG');
+    assert.equal(placeHintFromName('Jumbo Seafood Gallery').country, 'SG');
+    assert.equal(placeHintFromName("Don's Cafe"), null);
   });
 });

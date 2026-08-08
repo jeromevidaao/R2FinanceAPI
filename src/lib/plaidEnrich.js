@@ -49,6 +49,68 @@ function pickEnrichment(row) {
   return out;
 }
 
+/** Map full US state names (and common variants) → 2-letter codes. */
+const US_STATE_ABBR = {
+  alabama: 'AL',
+  alaska: 'AK',
+  arizona: 'AZ',
+  arkansas: 'AR',
+  california: 'CA',
+  colorado: 'CO',
+  connecticut: 'CT',
+  delaware: 'DE',
+  florida: 'FL',
+  georgia: 'GA',
+  hawaii: 'HI',
+  idaho: 'ID',
+  illinois: 'IL',
+  indiana: 'IN',
+  iowa: 'IA',
+  kansas: 'KS',
+  kentucky: 'KY',
+  louisiana: 'LA',
+  maine: 'ME',
+  maryland: 'MD',
+  massachusetts: 'MA',
+  michigan: 'MI',
+  minnesota: 'MN',
+  mississippi: 'MS',
+  missouri: 'MO',
+  montana: 'MT',
+  nebraska: 'NE',
+  nevada: 'NV',
+  'new hampshire': 'NH',
+  'new jersey': 'NJ',
+  'new mexico': 'NM',
+  'new york': 'NY',
+  'north carolina': 'NC',
+  'north dakota': 'ND',
+  ohio: 'OH',
+  oklahoma: 'OK',
+  oregon: 'OR',
+  pennsylvania: 'PA',
+  'rhode island': 'RI',
+  'south carolina': 'SC',
+  'south dakota': 'SD',
+  tennessee: 'TN',
+  texas: 'TX',
+  utah: 'UT',
+  vermont: 'VT',
+  virginia: 'VA',
+  washington: 'WA',
+  'west virginia': 'WV',
+  wisconsin: 'WI',
+  wyoming: 'WY',
+  'district of columbia': 'DC',
+};
+
+function usStateAbbr(region) {
+  const r = String(region || '').trim();
+  if (!r) return '';
+  if (/^[A-Za-z]{2}$/.test(r)) return r.toUpperCase();
+  return US_STATE_ABBR[r.toLowerCase()] || r;
+}
+
 /**
  * US → "City, ST". Outside US → "City, Country".
  * Null/missing country treated as US (Plaid country_codes: ['US']).
@@ -57,7 +119,7 @@ function pickEnrichment(row) {
 function formatLocationDisplay(loc) {
   if (!loc || typeof loc !== 'object') return null;
   const city = String(loc.city || '').trim();
-  const region = String(loc.region || '').trim();
+  const regionRaw = String(loc.region || '').trim();
   const countryRaw = String(loc.country || '').trim();
   const address = String(loc.address || '').trim();
   const c = countryRaw.toUpperCase();
@@ -69,6 +131,7 @@ function formatLocationDisplay(loc) {
     c === 'UNITED STATES OF AMERICA';
 
   if (isUS) {
+    const region = usStateAbbr(regionRaw);
     if (city && region) return `${city}, ${region}`;
     if (city) return city;
     if (region) return region;
@@ -702,7 +765,7 @@ async function enrichInboxNeedsAttention({ days = 90, runGeocode = true } = {}) 
     onlyMissing: true,
     spendingOnly: false,
     runGeocode,
-    maxGeocode: runGeocode ? 10 : 0,
+    maxGeocode: runGeocode ? 16 : 0,
     cacheDays: 180,
   });
 
@@ -750,7 +813,7 @@ async function enrichInboxNeedsAttention({ days = 90, runGeocode = true } = {}) 
         const { results } = await merchantLocation.geocodeCandidates(
           geoCandidates,
           priors,
-          { maxQueries: 8 },
+          { maxQueries: 16 },
         );
         for (const p of pending) {
           const id = p.plaidTxn.transaction_id;

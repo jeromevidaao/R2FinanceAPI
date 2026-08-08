@@ -379,23 +379,36 @@ async function persistMerchantCache(cache, planId = ledgerPlanId) {
 
 /**
  * User city priors from a location cache (most common cities first).
- * Used to bias geocode queries toward where this household actually spends.
+ * Uses every cityKey on multi-city merchants (not just the last pin).
  */
-function userCityPriors(cache, limit = 5) {
-  const counts = new Map(); // cityKey -> { city, region, country, n }
-  function tally(entry) {
-    if (!entry?.location?.city) return;
-    const loc = entry.location;
-    const ck = cityKey(loc);
-    if (!ck) return;
-    const prev = counts.get(ck) || {
-      city: loc.city,
-      region: loc.region || null,
-      country: loc.country || null,
+function userCityPriors(cache, limit = 6) {
+  const counts = new Map(); // city lower → { city, region, country, n }
+  function add(city, region, country, w = 1) {
+    if (!city) return;
+    const k = String(city).toLowerCase().trim();
+    if (!k) return;
+    const prev = counts.get(k) || {
+      city: String(city).trim(),
+      region: region || null,
+      country: country || null,
       n: 0,
     };
-    prev.n += 1;
-    counts.set(ck, prev);
+    prev.n += w;
+    // Prefer entries that include a region
+    if (!prev.region && region) prev.region = region;
+    counts.set(k, prev);
+  }
+  function tally(entry) {
+    if (entry?.cities && entry.cities.size) {
+      for (const ck of entry.cities) {
+        const [city, region] = String(ck).split('|');
+        if (city) add(city, region || null, null, 1);
+      }
+      return;
+    }
+    if (entry?.location?.city) {
+      add(entry.location.city, entry.location.region, entry.location.country, 1);
+    }
   }
   for (const e of (cache.byEntity || []).values()) tally(e);
   for (const e of (cache.byName || []).values()) tally(e);
@@ -410,17 +423,57 @@ function userCityPriors(cache, limit = 5) {
     }));
 }
 
+function cityMatchesPrior(locCity, priorCity) {
+  const a = normName(locCity);
+  const b = normName(priorCity);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+}
+
 /**
- * Nominatim (OSM) geocode — rate-limited, personal-use User-Agent.
- * Returns formatLocation-shaped object or null.
+ * Prefer a geocode hit that matches household priors and/or an explicit place hint.
+ * @param {{ city?: string, country?: string }|null} placeHint
  */
-async function geocodeNominatim(query, { signal } = {}) {
+function pickAcceptedLocation(candidates, priors, placeHint = null) {
+  const list = (candidates || []).filter(Boolean);
+  if (!list.length) return null;
+
+  if (placeHint?.country) {
+    const want = String(placeHint.country).toUpperCase();
+    const foreign = list.filter((loc) => {
+      const c = String(loc.country || '').toUpperCase();
+      return c === want || c.startsWith(want);
+    });
+    if (placeHint.city) {
+      const byCity = foreign.find((loc) => cityMatchesPrior(loc.city, placeHint.city));
+      if (byCity) return byCity;
+    }
+    if (foreign.length) return foreign[0];
+    return null; // do not fall back to US home priors for foreign-hinted merchants
+  }
+
+  if (!priors?.length) return list[0];
+  for (const loc of list) {
+    // Prefer US / empty country for home priors
+    const c = String(loc.country || '').toUpperCase();
+    if (c && c !== 'US' && c !== 'USA' && c !== 'UNITED STATES') continue;
+    if (priors.some((p) => cityMatchesPrior(loc.city, p.city))) return loc;
+  }
+  // No prior match — reject (avoids Korea for "Cafe Seattle" style noise)
+  return null;
+}
+
+/**
+ * Nominatim (OSM) geocode — personal-use User-Agent.
+ * Returns up to `limit` formatLocation-shaped objects.
+ */
+async function geocodeNominatim(query, { signal, limit = 3 } = {}) {
   const q = String(query || '').trim();
-  if (!q || q.length < 3) return null;
+  if (!q || q.length < 3) return [];
   const url = new URL('https://nominatim.openstreetmap.org/search');
   url.searchParams.set('q', q);
   url.searchParams.set('format', 'json');
-  url.searchParams.set('limit', '1');
+  url.searchParams.set('limit', String(limit));
   url.searchParams.set('addressdetails', '1');
   const res = await fetch(url.toString(), {
     headers: {
@@ -429,33 +482,122 @@ async function geocodeNominatim(query, { signal } = {}) {
     },
     signal,
   });
-  if (!res.ok) return null;
+  if (!res.ok) return [];
   const arr = await res.json();
-  const hit = Array.isArray(arr) ? arr[0] : null;
-  if (!hit) return null;
-  const addr = hit.address || {};
-  const city =
-    addr.city ||
-    addr.town ||
-    addr.village ||
-    addr.hamlet ||
-    addr.municipality ||
-    addr.suburb ||
-    null;
-  const region = addr.state || addr.region || null;
-  const country = addr.country_code
-    ? String(addr.country_code).toUpperCase()
-    : addr.country || null;
-  const loc = formatLocation({
-    address: hit.display_name?.split(',')[0] || null,
-    city,
-    region,
-    postal_code: addr.postcode || null,
-    country,
-    lat: hit.lat != null ? Number(hit.lat) : null,
-    lon: hit.lon != null ? Number(hit.lon) : null,
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((hit) => {
+      const addr = hit.address || {};
+      const city =
+        addr.city ||
+        addr.town ||
+        addr.village ||
+        addr.hamlet ||
+        addr.municipality ||
+        addr.suburb ||
+        null;
+      const region = addr.state || addr.region || null;
+      const country = addr.country_code
+        ? String(addr.country_code).toUpperCase()
+        : addr.country || null;
+      return formatLocation({
+        address: hit.display_name?.split(',')[0] || null,
+        city,
+        region,
+        postal_code: addr.postcode || null,
+        country,
+        lat: hit.lat != null ? Number(hit.lat) : null,
+        lon: hit.lon != null ? Number(hit.lon) : null,
+      });
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Photon (Komoot) — often better for POI names Nominatim misses.
+ * No key required; be gentle on rate.
+ */
+async function geocodePhoton(query, { signal, limit = 3 } = {}) {
+  const q = String(query || '').trim();
+  if (!q || q.length < 3) return [];
+  const url = new URL('https://photon.komoot.io/api/');
+  url.searchParams.set('q', q);
+  url.searchParams.set('limit', String(limit));
+  const res = await fetch(url.toString(), {
+    headers: { Accept: 'application/json' },
+    signal,
   });
-  return loc;
+  if (!res.ok) return [];
+  const body = await res.json();
+  const feats = body.features || [];
+  return feats
+    .map((f) => {
+      const p = f.properties || {};
+      const coords = f.geometry?.coordinates; // [lon, lat]
+      const city = p.city || p.locality || p.district || null;
+      const region = p.state || p.county || null;
+      const country = p.countrycode
+        ? String(p.countrycode).toUpperCase()
+        : p.country || null;
+      return formatLocation({
+        address: p.name || p.street || null,
+        city,
+        region,
+        postal_code: p.postcode || null,
+        country,
+        lat: coords ? Number(coords[1]) : null,
+        lon: coords ? Number(coords[0]) : null,
+      });
+    })
+    .filter(Boolean);
+}
+
+/** Try Nominatim then Photon; accept only prior-matching cities when priors given. */
+async function geocodeQuery(query, priors = [], { signal, placeHint = null } = {}) {
+  let hits = await geocodeNominatim(query, { signal, limit: 3 });
+  let accepted = pickAcceptedLocation(hits, priors, placeHint);
+  if (accepted) return accepted;
+  hits = await geocodePhoton(query, { signal, limit: 5 });
+  accepted = pickAcceptedLocation(hits, priors, placeHint);
+  return accepted;
+}
+
+/** Soft name variants to improve POI hit rate (Cafe ↔ Coffee, strip The). */
+function merchantQueryVariants(name) {
+  const base = String(name || '').trim();
+  if (!base) return [];
+  const out = [base];
+  const alt = base
+    .replace(/\bCafe\b/gi, 'Coffee')
+    .replace(/\bCoffee\b/gi, 'Cafe');
+  if (alt !== base) out.push(alt);
+  const noThe = base.replace(/^the\s+/i, '');
+  if (noThe !== base) out.push(noThe);
+  return [...new Set(out)];
+}
+
+/**
+ * Detect travel / foreign place hints in the merchant string so we do not
+ * pin "Singapore Food Street" to Bellevue via household priors.
+ */
+function placeHintFromName(name) {
+  const s = String(name || '');
+  const rules = [
+    { re: /\bsingapore\b/i, city: 'Singapore', country: 'SG' },
+    // Common SG chains that omit "Singapore" in the card descriptor
+    { re: /\bjumbo seafood\b/i, city: 'Singapore', country: 'SG' },
+    { re: /\btokyo\b|\bosaka\b|\bkyoto\b|\bjapan\b|\bhaneda\b|\bginza\b/i, country: 'JP' },
+    { re: /\bvietnam\b|\bhanoi\b|\bho chi minh\b|\bsaigon\b|\bda nang\b|\btam coc\b/i, country: 'VN' },
+    { re: /\bseoul\b|\bkorea\b/i, country: 'KR' },
+    { re: /\bbangkok\b|\bthailand\b/i, country: 'TH' },
+    { re: /\bparis\b|\bfrance\b/i, country: 'FR' },
+    { re: /\blondon\b|\buk\b|\bunited kingdom\b/i, country: 'GB' },
+    { re: /\bphu quoc\b/i, city: 'Phu Quoc', country: 'VN' },
+  ];
+  for (const r of rules) {
+    if (r.re.test(s)) return { city: r.city || null, country: r.country || null };
+  }
+  return null;
 }
 
 /**
@@ -466,23 +608,50 @@ function geocodeQueriesForMerchant(plaidTxn, cityPriors = []) {
   const channel = plaidTxn.payment_channel || '';
   const name = plaidTxn.merchant_name || plaidTxn.name;
   if (!name) return [];
-  if (channel === 'online' || channel === 'other') return [];
-  // ACH-like names
-  if (/ACH|PPD|WEB|PAYMENT|ORIG CO|PAYROLL|VENMO|ZELLE/i.test(plaidTxn.name || '')) {
+  if (channel === 'online') return [];
+  // ACH / card payments / peer transfer
+  if (
+    /ACH|PPD|WEB|PAYMENT TO |ORIG CO|PAYROLL|VENMO|ZELLE|WIRE/i.test(
+      plaidTxn.name || name || '',
+    )
+  ) {
     return [];
   }
+  // payment_channel "other" is often Airbnb/transfer — only allow if looks like a store
+  if (channel === 'other') return [];
   const isPhysical =
     channel === 'in store' ||
     (!channel && !/ACH|PPD|WEB|PAYMENT|ORIG CO/i.test(plaidTxn.name || ''));
   if (!isPhysical) return [];
 
+  // Rideshare / delivery apps — no fixed pin worth showing
+  if (
+    /\b(uber|lyft|doordash|grubhub|postmates|grab|foodpanda|gojek)\b/i.test(
+      name,
+    )
+  ) {
+    return [];
+  }
+
+  const names = merchantQueryVariants(name);
   const queries = [];
   const cityHint = plaidTxn.location?.city;
   const regionHint = plaidTxn.location?.region;
+  const placeHint = placeHintFromName(name);
+
+  // Travel / foreign merchants: only query with the place hint (skip home priors)
+  if (placeHint?.country) {
+    for (const n of names) {
+      const q = [n, placeHint.city, placeHint.country].filter(Boolean).join(', ');
+      if (!queries.includes(q)) queries.push(q);
+    }
+    return queries;
+  }
+
   if (cityHint) {
-    queries.push(
-      [name, cityHint, regionHint].filter(Boolean).join(', '),
-    );
+    for (const n of names) {
+      queries.push([n, cityHint, regionHint].filter(Boolean).join(', '));
+    }
   }
 
   const multi = isMultiCityBrand(name);
@@ -491,45 +660,73 @@ function geocodeQueriesForMerchant(plaidTxn, cityPriors = []) {
   }
 
   for (const p of cityPriors) {
-    const q = [name, p.city, p.region].filter(Boolean).join(', ');
-    if (!queries.includes(q)) queries.push(q);
-    if (queries.length >= 4) break;
+    for (const n of names) {
+      const q = [n, p.city, p.region].filter(Boolean).join(', ');
+      if (!queries.includes(q)) queries.push(q);
+    }
+    if (queries.length >= 8) break;
   }
 
-  // Local-only merchants: one bare query as last resort (Nominatim often needs city)
-  if (!multi && !queries.length) {
-    queries.push(name);
+  // Local-only merchants: bare query last (Photon may still hit; we require prior match)
+  if (!multi && cityPriors.length) {
+    for (const n of names) {
+      if (!queries.includes(n)) queries.push(n);
+    }
   }
 
   return queries;
 }
 
 /**
- * Run geocode for candidates; mutate cache + return map plaidTxnId → location.
- * maxQueries caps Nominatim calls per enrich run (default 12).
+ * Run geocode for candidates; return map plaidTxnId → location.
+ * maxQueries caps external calls per enrich run (default 14).
  */
-async function geocodeCandidates(candidates, cityPriors, { maxQueries = 12 } = {}) {
+async function geocodeCandidates(candidates, cityPriors, { maxQueries = 14 } = {}) {
   const results = new Map(); // plaid transaction_id → { location, query }
   let used = 0;
-  for (const c of candidates) {
+  // Prefer unique merchants first (one success seeds cache for siblings)
+  const seenMerchant = new Set();
+  const ordered = [...candidates].sort((a, b) => {
+    const na = (a.rawPlaid || a.plaid || a).merchant_name || '';
+    const nb = (b.rawPlaid || b.plaid || b).merchant_name || '';
+    return na.localeCompare(nb);
+  });
+
+  for (const c of ordered) {
     if (used >= maxQueries) break;
     const plaid = c.rawPlaid || c.plaid || c;
     const id = plaid.transaction_id || c.plaidTransactionId;
     if (!id || results.has(id)) continue;
+    const mkey = merchantNameKey(plaid.merchant_name || plaid.name);
+    // If we already geocoded this merchant name this run, reuse
+    if (mkey && seenMerchant.has(mkey)) {
+      const prev = [...results.values()].find(
+        (r) => merchantNameKey(r.merchant) === mkey,
+      );
+      if (prev) {
+        results.set(id, { ...prev });
+        continue;
+      }
+    }
     const queries = geocodeQueriesForMerchant(plaid, cityPriors);
     if (!queries.length) continue;
+    const placeHint = placeHintFromName(plaid.merchant_name || plaid.name);
     for (const q of queries) {
       if (used >= maxQueries) break;
       used += 1;
       try {
-        // Nominatim usage policy: max 1 req/sec
+        // ~1 req/sec across providers
         // eslint-disable-next-line no-await-in-loop
-        await new Promise((r) => setTimeout(r, used === 1 ? 0 : 1100));
+        await new Promise((r) => setTimeout(r, used === 1 ? 0 : 900));
         // eslint-disable-next-line no-await-in-loop
-        const loc = await geocodeNominatim(q);
+        const loc = await geocodeQuery(q, cityPriors, { placeHint });
         if (loc && (loc.city || loc.lat != null)) {
-          results.set(id, { location: loc, query: q, merchant: plaid.merchant_name || plaid.name });
-          // seed cache
+          results.set(id, {
+            location: loc,
+            query: q,
+            merchant: plaid.merchant_name || plaid.name,
+          });
+          if (mkey) seenMerchant.add(mkey);
           break;
         }
       } catch (e) {
@@ -559,7 +756,13 @@ module.exports = {
   harvestTxnLocations,
   persistMerchantCache,
   userCityPriors,
+  cityMatchesPrior,
+  pickAcceptedLocation,
   geocodeNominatim,
+  geocodePhoton,
+  geocodeQuery,
   geocodeQueriesForMerchant,
   geocodeCandidates,
+  merchantQueryVariants,
+  placeHintFromName,
 };
