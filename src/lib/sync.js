@@ -99,17 +99,57 @@ function categoryPullExtra(c, groupId, colorMap, userDeletedMap) {
 }
 
 /**
- * User-set account nicknames (aliases) live on ACCT# and must survive YNAB
- * full/delta rewrites — same pattern as category colors.
+ * Account nicknames (aliases) live on ACCT# and must survive YNAB full/delta
+ * rewrites — same pattern as category colors.
+ *
+ * YNAB has no separate "alias" field — only account `name` (GET /plans/…/accounts).
+ * R2 pre-seeds `alias` from that name; once the user saves a custom nickname
+ * (`aliasUserSet`), we keep their value and never overwrite from YNAB.
+ *
+ * Map value: { alias: string|null, userSet: boolean }
  */
+function isAliasUserSet(row) {
+  if (!row) return false;
+  if (row.aliasUserSet === true) return true;
+  if (row.aliasUserSet === false) return false;
+  // Legacy rows (before aliasUserSet): any stored alias counts as user-set
+  // so we never clobber nicknames that were already saved.
+  return !!(row.alias && String(row.alias).trim());
+}
+
 async function loadAccountAliasMap(planId) {
   const accts = await ddb.queryPk(ddb.planPk(planId), 'ACCT#');
   const map = new Map();
   for (const a of accts) {
     const id = a.ynabId || String(a.sk || '').replace(/^ACCT#/, '');
-    if (id && a.alias) map.set(id, String(a.alias));
+    if (!id) continue;
+    const alias =
+      a.alias != null && String(a.alias).trim()
+        ? String(a.alias).trim()
+        : null;
+    map.set(id, { alias, userSet: isAliasUserSet(a) });
   }
   return map;
+}
+
+/**
+ * Resolve R2 alias for a YNAB account row during pull.
+ * - User-set nickname → keep as-is (independent of YNAB renames).
+ * - Otherwise → seed/mirror from YNAB account name.
+ * Pure; exported for unit tests.
+ */
+function resolveAccountAliasForPull(ynabAccount, aliasEntry) {
+  const ynabName = String(ynabAccount?.name || '').trim().slice(0, 80) || null;
+  if (aliasEntry?.userSet) {
+    return {
+      alias: aliasEntry.alias || null,
+      aliasUserSet: true,
+    };
+  }
+  return {
+    alias: ynabName,
+    aliasUserSet: false,
+  };
 }
 
 /** Last-4 from YNAB account name (often ends with card/account digits). */
@@ -119,7 +159,7 @@ function extractAccountMask(name) {
 }
 
 function accountExtra(a, aliasMap) {
-  const alias = aliasMap.get(a.id);
+  const resolved = resolveAccountAliasForPull(a, aliasMap.get(a.id));
   const extra = {
     name: a.name,
     type: a.type,
@@ -127,13 +167,18 @@ function accountExtra(a, aliasMap) {
     balance: a.balance,
     closed: a.closed,
     deleted: !!a.deleted,
+    aliasUserSet: resolved.aliasUserSet,
   };
-  if (alias) extra.alias = alias;
+  if (resolved.alias) extra.alias = resolved.alias;
   return extra;
 }
 
 function mapAccount(i) {
   const name = i.name || i.payload?.name || '';
+  const alias =
+    i.alias != null && String(i.alias).trim()
+      ? String(i.alias).trim()
+      : null;
   return {
     ynabId: i.ynabId,
     name,
@@ -143,8 +188,13 @@ function mapAccount(i) {
     closed: !!(i.closed ?? i.payload?.closed ?? false),
     note: i.payload?.note ?? null,
     transferPayeeId: i.payload?.transfer_payee_id ?? null,
-    /** User nickname for UI (categorization, filters, transfers). */
-    alias: i.alias || null,
+    /**
+     * Display nickname (R2Finance-only). Seeded from YNAB account name until
+     * the user saves a custom value (aliasUserSet).
+     */
+    alias: alias || null,
+    /** true when the user saved a custom nickname (do not overwrite from YNAB). */
+    aliasUserSet: isAliasUserSet(i) && !!alias,
     /** Last-4 digits when present in the YNAB account name. */
     mask: extractAccountMask(name),
     deleted: !!i.deleted,
@@ -1797,6 +1847,9 @@ async function stats() {
 /**
  * Set or clear a user nickname (alias) on a ledger account.
  * Does not push to YNAB — aliases are R2Finance-only display labels.
+ *
+ * Saving a non-empty value marks aliasUserSet so later YNAB pulls keep it.
+ * Clearing removes the custom flag so the next pull re-seeds from the YNAB name.
  */
 async function setAccountAlias(ynabId, aliasRaw) {
   const id = String(ynabId || '').trim();
@@ -1817,10 +1870,57 @@ async function setAccountAlias(ynabId, aliasRaw) {
       ? null
       : String(aliasRaw).trim().slice(0, 80) || null;
   const next = { ...existing, updatedAt: Date.now() };
-  if (alias) next.alias = alias;
-  else delete next.alias;
+  if (alias) {
+    next.alias = alias;
+    next.aliasUserSet = true;
+  } else {
+    // Clear custom nickname → next YNAB pull re-mirrors account name.
+    delete next.alias;
+    delete next.aliasUserSet;
+  }
   await ddb.putItem(next);
   return mapAccount(next);
+}
+
+/**
+ * One-shot: seed R2 aliases from current YNAB account names for every open
+ * account that does not yet have a user-set nickname. Safe to call repeatedly.
+ * Returns { seeded, skipped, total }.
+ */
+async function seedAccountAliasesFromYnab(planId = ledgerPlanId) {
+  const accts = await ddb.queryPk(ddb.planPk(planId), 'ACCT#');
+  let seeded = 0;
+  let skipped = 0;
+  const now = Date.now();
+  for (const a of accts) {
+    if (a.deleted || a.closed) {
+      skipped += 1;
+      continue;
+    }
+    if (isAliasUserSet(a)) {
+      skipped += 1;
+      continue;
+    }
+    const ynabName = String(a.name || a.payload?.name || '')
+      .trim()
+      .slice(0, 80);
+    if (!ynabName) {
+      skipped += 1;
+      continue;
+    }
+    if (a.alias && String(a.alias).trim() === ynabName && a.aliasUserSet === false) {
+      skipped += 1;
+      continue;
+    }
+    await ddb.putItem({
+      ...a,
+      alias: ynabName,
+      aliasUserSet: false,
+      updatedAt: now,
+    });
+    seeded += 1;
+  }
+  return { seeded, skipped, total: accts.length };
 }
 
 /**
@@ -2116,6 +2216,8 @@ module.exports = {
   mapAccount,
   mapCategory,
   setAccountAlias,
+  seedAccountAliasesFromYnab,
+  resolveAccountAliasForPull,
   createCategoryEntity,
   updateCategoryEntity,
   deleteCategoryEntity,

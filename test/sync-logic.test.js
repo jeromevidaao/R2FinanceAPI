@@ -49,8 +49,48 @@ describe('account alias + mask', () => {
       alias: 'Joint checking',
     });
     assert.equal(mapped.alias, 'Joint checking');
+    assert.equal(mapped.aliasUserSet, true); // legacy stored alias = user-set
     assert.equal(mapped.mask, '1234');
     assert.equal(mapped.name, 'BoA Checkin 1234');
+  });
+
+  it('mapAccount marks YNAB-seeded aliases as not user-set', () => {
+    const { mapAccount } = require('../src/lib/sync');
+    const mapped = mapAccount({
+      ynabId: 'a2',
+      name: 'Chase Freedom 8053',
+      alias: 'Chase Freedom 8053',
+      aliasUserSet: false,
+    });
+    assert.equal(mapped.alias, 'Chase Freedom 8053');
+    assert.equal(mapped.aliasUserSet, false);
+  });
+
+  it('resolveAccountAliasForPull seeds from YNAB name when not user-set', () => {
+    const { resolveAccountAliasForPull } = require('../src/lib/sync');
+    const seeded = resolveAccountAliasForPull(
+      { name: 'BoA Checking 9911' },
+      undefined,
+    );
+    assert.equal(seeded.alias, 'BoA Checking 9911');
+    assert.equal(seeded.aliasUserSet, false);
+
+    const mirrored = resolveAccountAliasForPull(
+      { name: 'Renamed Checking' },
+      { alias: 'Old Name', userSet: false },
+    );
+    assert.equal(mirrored.alias, 'Renamed Checking');
+    assert.equal(mirrored.aliasUserSet, false);
+  });
+
+  it('resolveAccountAliasForPull preserves user-set nicknames', () => {
+    const { resolveAccountAliasForPull } = require('../src/lib/sync');
+    const kept = resolveAccountAliasForPull(
+      { name: 'Chase Sapphire 1234' },
+      { alias: 'Jerome Sapphire', userSet: true },
+    );
+    assert.equal(kept.alias, 'Jerome Sapphire');
+    assert.equal(kept.aliasUserSet, true);
   });
 });
 

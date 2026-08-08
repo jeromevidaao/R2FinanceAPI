@@ -431,11 +431,30 @@ exports.handler = async (event) => {
       });
     }
 
+    // POST /v1/accounts/seed-aliases
+    // Pre-fill empty (non-user-set) aliases from YNAB account names.
+    // YNAB has no separate alias API — we use GET /plans/{id}/accounts → name.
+    if (method === 'POST' && path === '/v1/accounts/seed-aliases') {
+      // Prefer live YNAB names via pull, then backfill any remaining rows.
+      try {
+        await sync.deltaPull();
+      } catch (e) {
+        // Pull may fail if offline; still seed from last-known DDB names.
+        console.warn('seed-aliases pull skipped', e?.message || e);
+      }
+      const report = await sync.seedAccountAliasesFromYnab();
+      return respond(200, { ok: true, ...report });
+    }
+
     // PATCH /v1/accounts/{ynabId}  body: { alias: "nickname" | null }
     // R2Finance-only nickname used in Categorization and the rest of the UI.
+    // Match single-account paths only (not /v1/accounts/seed-aliases).
     const accountAliasMatch = path.match(/^\/v1\/accounts\/([^/]+)$/);
     if (accountAliasMatch && (method === 'PATCH' || method === 'POST')) {
       const ynabId = decodeURIComponent(accountAliasMatch[1]);
+      if (ynabId === 'seed-aliases') {
+        return respond(404, { error: 'not found' });
+      }
       const body = parseBody(event);
       if (!Object.prototype.hasOwnProperty.call(body || {}, 'alias')) {
         return respond(400, { error: 'alias required (string or null)' });
