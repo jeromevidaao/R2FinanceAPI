@@ -225,8 +225,9 @@ async function createSession(email) {
 }
 
 /**
- * Validate bearer session. Rejects expired tokens and any email not on
- * the hard allow-list (Jerome + Ngoc only). Fail closed on storage errors.
+ * Validate bearer session. Rejects expired tokens, emails not on the hard
+ * allow-list (Jerome + Ngoc only), and any user who has not enrolled MFA.
+ * Fail closed on storage errors.
  */
 async function validateSession(token) {
   if (!token) return null;
@@ -238,6 +239,9 @@ async function validateSession(token) {
     if (!s || !s.expiresAt || s.expiresAt < Date.now()) return null;
     const e = normalizeEmail(s.email);
     if (!isAllowedEmail(e)) return null;
+    // Kill sessions issued before MFA was required (e.g. Ngoc password-only).
+    const user = await getUser(e);
+    if (!user || !user.mfaEnabled || !user.totpSecret) return null;
     return { ...s, email: e };
   } catch (err) {
     console.error(
@@ -264,10 +268,10 @@ async function login(email, password) {
     err.status = 401;
     throw err;
   }
-  // MFA optional: if not enabled, issue session (user can enable later).
-  if (!user.mfaEnabled) {
-    const session = await createSession(e);
-    return { ok: true, ...session, email: e };
+  // MFA is mandatory for every household user (Jerome + Ngoc).
+  // Never issue a session until authenticator MFA is enrolled and verified.
+  if (!user.mfaEnabled || !user.totpSecret) {
+    return { ok: false, next: 'mfa_setup', email: e };
   }
   // Issue short-lived pending token for MFA step (reuse session table with flag)
   const pending = crypto.randomBytes(24).toString('hex');
@@ -614,8 +618,9 @@ async function inviteUser(email, { ccAdmin = true } = {}) {
       </p>
       <p style="color:#555;font-size:13px;word-break:break-all">${link}</p>
       <p style="color:#777;font-size:13px">
-        After setting a password, sign in with <strong>${e}</strong> on the website
-        (or the R2Finance Android app).
+        After setting a password, you must enroll <strong>authenticator MFA</strong>
+        (Google Authenticator / Authy / 1Password). Password-only access is not allowed.
+        Then sign in with <strong>${e}</strong> on the website or the R2Finance Android app.
       </p>
     </div>
   `;
