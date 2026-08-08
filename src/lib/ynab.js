@@ -127,6 +127,34 @@ async function updateCategory(planId, categoryId, patch) {
   return r.data.category;
 }
 
+/**
+ * Delete a category in YNAB.
+ * Official OpenAPI (v1.86) does not document DELETE for categories — may 404/405.
+ * Callers should soft-delete in DDB and treat failure as ynabSynced=false.
+ */
+async function deleteCategory(planId, categoryId) {
+  const r = await ynabFetch(`/plans/${planId}/categories/${categoryId}`, {
+    method: 'DELETE',
+  });
+  return r.data || r;
+}
+
+async function createCategoryGroup(planId, { name }) {
+  const r = await ynabFetch(`/plans/${planId}/category_groups`, {
+    method: 'POST',
+    body: { category_group: { name } },
+  });
+  return r.data.category_group;
+}
+
+async function updateCategoryGroup(planId, groupId, patch) {
+  const r = await ynabFetch(`/plans/${planId}/category_groups/${groupId}`, {
+    method: 'PATCH',
+    body: { category_group: patch },
+  });
+  return r.data.category_group;
+}
+
 module.exports = {
   ynabFetch,
   listPlans,
@@ -140,4 +168,7 @@ module.exports = {
   createPayee,
   createCategory,
   updateCategory,
+  deleteCategory,
+  createCategoryGroup,
+  updateCategoryGroup,
 };

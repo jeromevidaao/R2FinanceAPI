@@ -39,6 +39,9 @@ Phone (Room)  ──POST /v1/device/push──►  DynamoDB  ──pushPending /
 | GET | `/v1/stats` | Counts by entity type |
 | GET | `/v1/accounts` | Accounts from DDB |
 | GET | `/v1/categories` | Categories from DDB |
+| POST | `/v1/categories` | Create category → YNAB + DDB (`name`, `categoryGroupId`) |
+| PATCH | `/v1/categories/{ynabId}` | Rename / move group → YNAB + DDB |
+| DELETE | `/v1/categories/{ynabId}` | Soft-delete in DDB; attempts YNAB DELETE (often unsupported) |
 | GET | `/v1/inbox` | Unapproved + uncategorized (YNAB-style needs-attention) |
 | POST | `/v1/sync/import` | Full import |
 | POST | `/v1/sync/pull` | Delta pull |

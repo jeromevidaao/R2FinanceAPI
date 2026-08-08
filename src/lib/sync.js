@@ -22,6 +22,83 @@ async function loadCategoryColorMap(planId) {
 }
 
 /**
+ * Categories soft-deleted in R2Finance (YNAB API has no documented DELETE for
+ * categories). Survives YNAB full/delta rewrites until YNAB itself marks deleted.
+ */
+async function loadCategoryUserDeletedMap(planId) {
+  const cats = await ddb.queryPk(ddb.planPk(planId), 'CAT#');
+  const map = new Map();
+  for (const c of cats) {
+    const id = c.ynabId || String(c.sk || '').replace(/^CAT#/, '');
+    if (id && c.userDeleted) map.set(id, true);
+  }
+  return map;
+}
+
+function isSystemCategoryGroupName(name) {
+  const g = String(name || '')
+    .trim()
+    .toLowerCase();
+  return (
+    g === 'internal master category' ||
+    g === 'credit card payments' ||
+    g === 'hidden categories'
+  );
+}
+
+function isSystemCategoryName(name) {
+  const c = String(name || '')
+    .trim()
+    .toLowerCase();
+  if (!c) return false;
+  if (c === 'uncategorized') return true;
+  if (c.includes('ready to assign')) return true;
+  return false;
+}
+
+function mapCategory(c) {
+  return {
+    ynabId: c.ynabId,
+    name: c.name,
+    categoryGroupId: c.categoryGroupId ?? null,
+    hidden: c.hidden ?? false,
+    color: c.color || null,
+    deleted: !!c.deleted,
+  };
+}
+
+async function resolveYnabPlanId() {
+  const meta = await ddb.getItem(ddb.planPk(), 'META');
+  const id = meta?.ynabPlanId || meta?.payload?.ynabPlanId;
+  if (!id) {
+    const err = new Error('no ynabPlanId — run full import first');
+    err.status = 400;
+    throw err;
+  }
+  return id;
+}
+
+/**
+ * Extra fields for CAT# upsert from YNAB pull, preserving color + userDeleted.
+ */
+function categoryPullExtra(c, groupId, colorMap, userDeletedMap) {
+  const base = categoryColorExtra(c, groupId, colorMap);
+  const userDeleted = !c.deleted && userDeletedMap.has(c.id);
+  if (userDeleted) {
+    return {
+      ...base,
+      deleted: true,
+      userDeleted: true,
+      hidden: true,
+    };
+  }
+  if (c.deleted) {
+    return { ...base, deleted: true, userDeleted: false };
+  }
+  return { ...base, userDeleted: false };
+}
+
+/**
  * User-set account nicknames (aliases) live on ACCT# and must survive YNAB
  * full/delta rewrites — same pattern as category colors.
  */
@@ -518,6 +595,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
   }
 
   const categoryColorMap = await loadCategoryColorMap(planId);
+  const categoryUserDeletedMap = await loadCategoryUserDeletedMap(planId);
 
   for (const g of categoriesR.categoryGroups) {
     if (g.deleted) continue;
@@ -532,7 +610,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
       }),
     );
     for (const c of g.categories || []) {
-      if (c.deleted) continue;
+      if (c.deleted && !categoryUserDeletedMap.has(c.id)) continue;
       items.push(
         entityItem({
           planId,
@@ -540,7 +618,12 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
           entityType: 'category',
           ynabId: c.id,
           payload: c,
-          extra: categoryColorExtra(c, g.id, categoryColorMap),
+          extra: categoryPullExtra(
+            c,
+            g.id,
+            categoryColorMap,
+            categoryUserDeletedMap,
+          ),
         }),
       );
     }
@@ -724,6 +807,7 @@ async function deltaPull() {
   const categoriesR = await ynab.listCategories(ynabPlanId, last);
   knowledge = Math.max(knowledge, categoriesR.serverKnowledge);
   const categoryColorMap = await loadCategoryColorMap(planId);
+  const categoryUserDeletedMap = await loadCategoryUserDeletedMap(planId);
   for (const g of categoriesR.categoryGroups) {
     items.push(
       entityItem({
@@ -743,7 +827,12 @@ async function deltaPull() {
           entityType: 'category',
           ynabId: c.id,
           payload: c,
-          extra: categoryColorExtra(c, g.id, categoryColorMap),
+          extra: categoryPullExtra(
+            c,
+            g.id,
+            categoryColorMap,
+            categoryUserDeletedMap,
+          ),
         }),
       );
     }
@@ -945,20 +1034,70 @@ async function pushPending({ limit = 40 } = {}) {
   const results = [];
   for (const item of pending) {
     if (item.entityType !== 'transaction' && !String(item.sk || '').startsWith('TXN#')) {
-      // Categories pending push
+      // Categories pending push (legacy offline path; website uses immediate dual-write)
       if (item.entityType === 'category' && item.syncStatus === 'PENDING_PUSH') {
         try {
-          if (item.ynabId) {
-            await ynab.updateCategory(ynabPlanId, item.ynabId, {
-              name: item.name || item.payload?.name,
+          if (item.userDeleted || item.deleted) {
+            try {
+              if (item.ynabId) {
+                await ynab.deleteCategory(ynabPlanId, item.ynabId);
+              }
+            } catch (delErr) {
+              // YNAB may not support DELETE — keep soft-delete in DDB.
+              console.warn('category delete push', delErr.message);
+            }
+            await ddb.markSynced(item.pk, item.sk, {
+              deleted: true,
+              userDeleted: true,
+              hidden: true,
             });
+            results.push({ sk: item.sk, ok: true, deleted: true });
+            continue;
+          }
+          if (item.ynabId) {
+            const patch = {
+              name: item.name || item.payload?.name,
+            };
+            const groupId =
+              item.categoryGroupId || item.payload?.category_group_id;
+            if (groupId) patch.category_group_id = groupId;
+            await ynab.updateCategory(ynabPlanId, item.ynabId, patch);
           } else if (item.payload?.category_group_id || item.categoryGroupId) {
             const created = await ynab.createCategory(ynabPlanId, {
               name: item.name || item.payload?.name,
-              category_group_id: item.categoryGroupId || item.payload.category_group_id,
+              category_group_id:
+                item.categoryGroupId || item.payload.category_group_id,
             });
-            await ddb.markSynced(item.pk, item.sk, { ynabId: created.id });
-            results.push({ sk: item.sk, ok: true, created: true });
+            const newSk = `CAT#${created.id}`;
+            const now = Date.now();
+            await ddb.putItem({
+              ...item,
+              sk: newSk,
+              ynabId: created.id,
+              name: created.name || item.name,
+              categoryGroupId:
+                created.category_group_id ||
+                item.categoryGroupId ||
+                item.payload?.category_group_id,
+              payload: created,
+              syncStatus: 'SYNCED',
+              updatedAt: now,
+              lastPushedAt: now,
+              gsi2pk: undefined,
+              gsi2sk: undefined,
+            });
+            // Drop provisional row if sk was different (client-temp id)
+            if (item.sk !== newSk) {
+              await ddb.putItem({
+                ...item,
+                deleted: true,
+                syncStatus: 'SYNCED',
+                updatedAt: now,
+                gsi2pk: undefined,
+                gsi2sk: undefined,
+              });
+            }
+            results.push({ sk: item.sk, ok: true, created: true, ynabId: created.id });
             continue;
           }
           await ddb.markSynced(item.pk, item.sk);
@@ -1684,6 +1823,286 @@ async function setAccountAlias(ynabId, aliasRaw) {
   return mapAccount(next);
 }
 
+/**
+ * Create a category in YNAB then write CAT# to DynamoDB (immediate dual-write).
+ * @param {{ name: string, categoryGroupId: string }} body
+ */
+async function createCategoryEntity({ name, categoryGroupId }) {
+  const n = String(name || '').trim().slice(0, 100);
+  const groupId = String(categoryGroupId || '').trim();
+  if (!n) {
+    const err = new Error('name required');
+    err.status = 400;
+    throw err;
+  }
+  if (!groupId) {
+    const err = new Error('categoryGroupId required');
+    err.status = 400;
+    throw err;
+  }
+  if (isSystemCategoryName(n)) {
+    const err = new Error('cannot create a system category name');
+    err.status = 400;
+    throw err;
+  }
+
+  const group = await ddb.getItem(ddb.planPk(), `CGRP#${groupId}`);
+  if (!group || group.deleted) {
+    const err = new Error('category group not found');
+    err.status = 404;
+    throw err;
+  }
+  if (isSystemCategoryGroupName(group.name)) {
+    const err = new Error(
+      `cannot add categories to system group “${group.name}”`,
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  const ynabPlanId = await resolveYnabPlanId();
+  let created;
+  try {
+    created = await ynab.createCategory(ynabPlanId, {
+      name: n,
+      category_group_id: groupId,
+    });
+  } catch (e) {
+    const err = new Error(e.message || 'YNAB create category failed');
+    err.status = e.status || 502;
+    err.body = e.body;
+    throw err;
+  }
+
+  const catId = created.id;
+  const color = colorForCategory({
+    name: created.name || n,
+    ynabId: catId,
+  });
+  const now = Date.now();
+  const item = {
+    pk: ddb.planPk(),
+    sk: `CAT#${catId}`,
+    entityType: 'category',
+    ynabId: catId,
+    name: created.name || n,
+    categoryGroupId: created.category_group_id || groupId,
+    hidden: !!created.hidden,
+    deleted: false,
+    userDeleted: false,
+    color,
+    syncStatus: 'SYNCED',
+    updatedAt: now,
+    lastPushedAt: now,
+    payload: created,
+  };
+  await ddb.putItem(item);
+  return {
+    ok: true,
+    ynab: true,
+    category: mapCategory(item),
+  };
+}
+
+/**
+ * Update category name and/or group in YNAB + DynamoDB.
+ * @param {{ ynabId: string, name?: string, categoryGroupId?: string }} body
+ */
+async function updateCategoryEntity({ ynabId, name, categoryGroupId }) {
+  const id = String(ynabId || '').trim();
+  if (!id) {
+    const err = new Error('ynabId required');
+    err.status = 400;
+    throw err;
+  }
+  const existing = await ddb.getItem(ddb.planPk(), `CAT#${id}`);
+  if (!existing || existing.deleted) {
+    const err = new Error('category not found');
+    err.status = 404;
+    throw err;
+  }
+  if (isSystemCategoryName(existing.name)) {
+    const err = new Error('cannot modify a system category');
+    err.status = 400;
+    throw err;
+  }
+
+  const existingGroupId = existing.categoryGroupId;
+  if (existingGroupId) {
+    const eg = await ddb.getItem(ddb.planPk(), `CGRP#${existingGroupId}`);
+    if (eg && isSystemCategoryGroupName(eg.name)) {
+      const err = new Error('cannot modify a system category');
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  const patch = {};
+  if (name !== undefined && name !== null) {
+    const n = String(name).trim().slice(0, 100);
+    if (!n) {
+      const err = new Error('name cannot be empty');
+      err.status = 400;
+      throw err;
+    }
+    if (isSystemCategoryName(n)) {
+      const err = new Error('cannot rename to a system category name');
+      err.status = 400;
+      throw err;
+    }
+    patch.name = n;
+  }
+  if (categoryGroupId !== undefined && categoryGroupId !== null) {
+    const groupId = String(categoryGroupId).trim();
+    if (!groupId) {
+      const err = new Error('categoryGroupId cannot be empty');
+      err.status = 400;
+      throw err;
+    }
+    const group = await ddb.getItem(ddb.planPk(), `CGRP#${groupId}`);
+    if (!group || group.deleted) {
+      const err = new Error('category group not found');
+      err.status = 404;
+      throw err;
+    }
+    if (isSystemCategoryGroupName(group.name)) {
+      const err = new Error(
+        `cannot move categories into system group “${group.name}”`,
+      );
+      err.status = 400;
+      throw err;
+    }
+    patch.category_group_id = groupId;
+  }
+
+  if (Object.keys(patch).length === 0) {
+    const err = new Error('name or categoryGroupId required');
+    err.status = 400;
+    throw err;
+  }
+
+  const ynabPlanId = await resolveYnabPlanId();
+  let updated;
+  try {
+    updated = await ynab.updateCategory(ynabPlanId, id, patch);
+  } catch (e) {
+    const err = new Error(e.message || 'YNAB update category failed');
+    err.status = e.status || 502;
+    err.body = e.body;
+    throw err;
+  }
+
+  const now = Date.now();
+  const nextName = updated?.name || patch.name || existing.name;
+  const nextGroup =
+    updated?.category_group_id ||
+    patch.category_group_id ||
+    existing.categoryGroupId;
+  // Keep color unless name changed to something colorForCategory prefers (preserve).
+  const color =
+    existing.color ||
+    colorForCategory({ name: nextName, ynabId: id });
+  const item = {
+    ...existing,
+    name: nextName,
+    categoryGroupId: nextGroup,
+    hidden: updated?.hidden ?? existing.hidden ?? false,
+    deleted: false,
+    userDeleted: false,
+    color,
+    payload: { ...(existing.payload || {}), ...(updated || {}), ...patch },
+    syncStatus: 'SYNCED',
+    updatedAt: now,
+    lastPushedAt: now,
+  };
+  delete item.gsi2pk;
+  delete item.gsi2sk;
+  await ddb.putItem(item);
+  return {
+    ok: true,
+    ynab: true,
+    category: mapCategory(item),
+  };
+}
+
+/**
+ * Soft-delete category in DynamoDB; attempt YNAB DELETE (often unsupported).
+ * userDeleted survives YNAB pulls so the row stays hidden in R2Finance.
+ */
+async function deleteCategoryEntity({ ynabId }) {
+  const id = String(ynabId || '').trim();
+  if (!id) {
+    const err = new Error('ynabId required');
+    err.status = 400;
+    throw err;
+  }
+  const existing = await ddb.getItem(ddb.planPk(), `CAT#${id}`);
+  if (!existing || (existing.deleted && existing.userDeleted)) {
+    const err = new Error('category not found');
+    err.status = 404;
+    throw err;
+  }
+  if (isSystemCategoryName(existing.name)) {
+    const err = new Error('cannot delete a system category');
+    err.status = 400;
+    throw err;
+  }
+  if (existing.categoryGroupId) {
+    const eg = await ddb.getItem(
+      ddb.planPk(),
+      `CGRP#${existing.categoryGroupId}`,
+    );
+    if (eg && isSystemCategoryGroupName(eg.name)) {
+      const err = new Error('cannot delete a system category');
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  let ynabOk = false;
+  let ynabError = null;
+  try {
+    const ynabPlanId = await resolveYnabPlanId();
+    await ynab.deleteCategory(ynabPlanId, id);
+    ynabOk = true;
+  } catch (e) {
+    ynabError = e.message || String(e);
+    // Expected: OpenAPI has no DELETE for categories (404/405).
+    console.warn(
+      JSON.stringify({
+        msg: 'category delete→ynab',
+        ynabId: id,
+        error: ynabError,
+        status: e.status,
+      }),
+    );
+  }
+
+  const now = Date.now();
+  const item = {
+    ...existing,
+    deleted: true,
+    userDeleted: true,
+    hidden: true,
+    syncStatus: 'SYNCED',
+    updatedAt: now,
+    ...(ynabOk ? { lastPushedAt: now } : {}),
+  };
+  delete item.gsi2pk;
+  delete item.gsi2sk;
+  await ddb.putItem(item);
+
+  return {
+    ok: true,
+    ynabId: id,
+    ynab: ynabOk,
+    ynabError: ynabOk ? null : ynabError,
+    warning: ynabOk
+      ? null
+      : 'Removed from R2Finance. YNAB has no documented delete-category API — hide or delete it in the YNAB app if you want it gone there too (R2 will keep it hidden on pulls).',
+  };
+}
+
 module.exports = {
   fullImport,
   deltaPull,
@@ -1695,8 +2114,14 @@ module.exports = {
   listChanges,
   mapTxn,
   mapAccount,
+  mapCategory,
   setAccountAlias,
+  createCategoryEntity,
+  updateCategoryEntity,
+  deleteCategoryEntity,
   extractAccountMask,
+  isSystemCategoryGroupName,
+  isSystemCategoryName,
   stats,
   uuid,
   tombstoneTxnItem,

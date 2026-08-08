@@ -65,7 +65,7 @@ function json(statusCode, body, event = null) {
     'access-control-allow-origin': corsOrigin(event),
     'access-control-allow-headers':
       'authorization,content-type,x-r2finance-client,x-client,accept-encoding',
-    'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
+    'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
     vary: 'Origin, Accept-Encoding',
   };
   const raw = JSON.stringify(body == null ? {} : body);
@@ -479,6 +479,56 @@ exports.handler = async (event) => {
           })),
         categories,
       });
+    }
+
+    // POST /v1/categories  body: { name, categoryGroupId } → YNAB + DDB
+    if (method === 'POST' && path === '/v1/categories') {
+      const body = parseBody(event);
+      try {
+        const result = await sync.createCategoryEntity({
+          name: body.name,
+          categoryGroupId: body.categoryGroupId || body.category_group_id,
+        });
+        return respond(200, result);
+      } catch (e) {
+        return respond(e.status || 500, {
+          error: e.message || 'create category failed',
+        });
+      }
+    }
+
+    // PATCH /v1/categories/{ynabId}  body: { name?, categoryGroupId? }
+    // DELETE /v1/categories/{ynabId}
+    const categoryMatch = path.match(/^\/v1\/categories\/([^/]+)$/);
+    if (categoryMatch && (method === 'PATCH' || method === 'POST')) {
+      const ynabId = decodeURIComponent(categoryMatch[1]);
+      const body = parseBody(event);
+      try {
+        const result = await sync.updateCategoryEntity({
+          ynabId,
+          name: body.name,
+          categoryGroupId:
+            body.categoryGroupId !== undefined
+              ? body.categoryGroupId
+              : body.category_group_id,
+        });
+        return respond(200, result);
+      } catch (e) {
+        return respond(e.status || 500, {
+          error: e.message || 'update category failed',
+        });
+      }
+    }
+    if (categoryMatch && method === 'DELETE') {
+      const ynabId = decodeURIComponent(categoryMatch[1]);
+      try {
+        const result = await sync.deleteCategoryEntity({ ynabId });
+        return respond(200, result);
+      } catch (e) {
+        return respond(e.status || 500, {
+          error: e.message || 'delete category failed',
+        });
+      }
     }
 
     if (method === 'GET' && path === '/v1/payees') {

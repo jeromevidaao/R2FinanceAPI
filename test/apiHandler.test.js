@@ -37,6 +37,9 @@ describe('R2FinanceApiHandler', () => {
       ['POST', '/v1/accounts/some-id'],
       ['GET', '/v1/transactions'],
       ['GET', '/v1/categories'],
+      ['POST', '/v1/categories'],
+      ['PATCH', '/v1/categories/some-id'],
+      ['DELETE', '/v1/categories/some-id'],
       ['GET', '/v1/payees'],
       ['GET', '/v1/plan'],
       ['GET', '/v1/inbox'],
@@ -55,7 +58,8 @@ describe('R2FinanceApiHandler', () => {
       const res = await handler({
         rawPath: path,
         requestContext: { http: { method } },
-        body: method === 'POST' ? '{}' : undefined,
+        body:
+          method === 'POST' || method === 'PATCH' ? '{}' : undefined,
       });
       assert.equal(
         res.statusCode,
