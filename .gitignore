@@ -8,3 +8,8 @@ coverage/
 .api-endpoint
 *.zip
 node_modules/
+
+# local amazon POC venv + amazon-orders debug dumps
+.venv-amazon-poc/
+output/
+

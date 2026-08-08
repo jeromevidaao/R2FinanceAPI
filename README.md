@@ -100,6 +100,15 @@ bash scripts/deploy.sh
 bash scripts/invoke-import.sh   # full YNAB → DDB
 ```
 
+## Amazon order enrichment (POC)
+
+Bank descriptors like `AMAZON MKTPL*…` land in the ledger without line items. There is **no official consumer Amazon order API**; see:
+
+- `docs/AMAZON_ORDER_MATCH_POC.md`
+- `scripts/poc-amazon-order-match.py` — reads DDB + SSM `/r2finance/amazon`, optional live scrape via unofficial `amazon-orders` library
+
+Credentials: SSM SecureString only (`/r2finance/amazon`). Never commit.
+
 ## Cost
 
 API Gateway HTTP + Lambda + DynamoDB on-demand only. 15‑minute schedule stays under YNAB’s **200 req/h** limit for personal use.
