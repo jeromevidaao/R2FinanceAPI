@@ -469,6 +469,8 @@ exports.handler = async (event) => {
     // Access only — never write bank transactions into DDB ledger TXN#.
     // Supported banks: boa, chase, vanguard, venmo (see connectors.BANKS).
     // Each household member has their own set (2× each bank type).
+    // Accounts UI reads CONNECTOR cache (balances); live Plaid only on
+    // explicit refresh / Link exchange / enrich (transactions match).
     if (method === 'GET' && path === '/v1/connectors') {
       const qs = event?.queryStringParameters || {};
       if (qs.household === '1' || qs.household === 'true') {
@@ -477,12 +479,21 @@ exports.handler = async (event) => {
       return respond(200, await connectors.listStatus({ email: session.email }));
     }
 
+    // Probe every connected bank for this user → write balances to cache.
+    if (method === 'POST' && path === '/v1/connectors/refresh-balances') {
+      return respond(
+        200,
+        await connectors.refreshAllBalances({ email: session.email }),
+      );
+    }
+
     const connectorMatch = path.match(
       /^\/v1\/connectors\/([a-z0-9_-]+)(?:\/(link-token|exchange|accounts|disconnect))?$/,
     );
     if (connectorMatch) {
       const bankId = connectorMatch[1];
       const action = connectorMatch[2] || null;
+      const qs = event?.queryStringParameters || {};
 
       if (method === 'GET' && !action) {
         return respond(
@@ -516,10 +527,22 @@ exports.handler = async (event) => {
         return respond(200, result);
       }
 
+      // Default: connector cache (no Plaid). ?live=1 / ?probe=1 hits Plaid.
       if (method === 'GET' && action === 'accounts') {
+        const live =
+          qs.live === '1' ||
+          qs.live === 'true' ||
+          qs.probe === '1' ||
+          qs.probe === 'true';
+        if (live) {
+          return respond(
+            200,
+            await connectors.probeAccounts(bankId, { email: session.email }),
+          );
+        }
         return respond(
           200,
-          await connectors.probeAccounts(bankId, { email: session.email }),
+          await connectors.cachedAccounts(bankId, { email: session.email }),
         );
       }
 

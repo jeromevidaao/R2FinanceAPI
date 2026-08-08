@@ -163,6 +163,46 @@ function mapAccount(a) {
 }
 
 /**
+ * Compact row stored on CONNECTOR meta (DDB). Includes Plaid balances so
+ * Accounts UI can load capital without a live Plaid call.
+ * Plaid products remain transactions-only; balances come from accounts/get
+ * when we connect or when the client explicitly refreshes.
+ */
+function toAccountPreview(a) {
+  const bal = a.balances || {};
+  return {
+    accountId: a.accountId,
+    name: a.name,
+    officialName: a.officialName || null,
+    mask: a.mask ?? null,
+    type: a.type ?? null,
+    subtype: a.subtype ?? null,
+    available: bal.available ?? null,
+    current: bal.current ?? null,
+    limit: bal.limit ?? null,
+    isoCurrencyCode: bal.isoCurrencyCode || 'USD',
+  };
+}
+
+/** Prefer Plaid available; fall back to current for display / capital. */
+function displayBalance(preview) {
+  if (preview == null) return null;
+  if (preview.available != null && !Number.isNaN(Number(preview.available))) {
+    return Number(preview.available);
+  }
+  if (preview.current != null && !Number.isNaN(Number(preview.current))) {
+    return Number(preview.current);
+  }
+  return null;
+}
+
+function isCreditType(type, subtype) {
+  const t = String(type || '').toLowerCase();
+  const s = String(subtype || '').toLowerCase();
+  return t === 'credit' || s === 'credit card' || s === 'paypal';
+}
+
+/**
  * One-time migration: plan-level CONNECTOR#* → USER#email when this email owns it.
  * Safe to call on every status/list (no-op if already migrated).
  */
@@ -250,6 +290,7 @@ async function status(bankId, { email } = {}) {
   const hasToken = !!(await getAccessToken(bank, e));
   const connected = !!(meta?.connected && hasToken);
 
+  const accountsPreview = meta?.accountsPreview || [];
   return {
     connectorId: bank.id,
     email: e,
@@ -263,10 +304,11 @@ async function status(bankId, { email } = {}) {
     connectedAt: meta?.connectedAt || null,
     connectedBy: meta?.connectedBy || e,
     institutionName: meta?.institutionName || bank.name,
-    accountCount: meta?.accountCount ?? null,
-    accountsPreview: meta?.accountsPreview || [],
+    accountCount: meta?.accountCount ?? accountsPreview.length ?? null,
+    accountsPreview,
+    lastBalancesAt: meta?.lastBalancesAt || meta?.lastProbedAt || null,
     note:
-      'Per-user access only — bank transactions are not written to the R2Finance DDB ledger yet.',
+      'Accounts UI reads connector cache (balances). Plaid is for transaction match + balance refresh only.',
   };
 }
 
@@ -298,6 +340,7 @@ async function listHousehold({ email } = {}) {
       const configured = await plaid.isConfigured();
       const meta = await getMeta(bank, u);
       const hasToken = !!(await getAccessToken(bank, u));
+      const accountsPreview = meta?.accountsPreview || [];
       connectors.push({
         connectorId: bank.id,
         email: normalizeEmail(u),
@@ -305,9 +348,11 @@ async function listHousehold({ email } = {}) {
         institutionName: meta?.institutionName || bank.name,
         configured,
         connected: !!(meta?.connected && hasToken),
-        accountCount: meta?.accountCount ?? null,
+        accountCount: meta?.accountCount ?? accountsPreview.length ?? null,
         connectedAt: meta?.connectedAt || null,
         itemId: meta?.itemId || null,
+        accountsPreview,
+        lastBalancesAt: meta?.lastBalancesAt || meta?.lastProbedAt || null,
       });
     }
     byUser.push({ email: normalizeEmail(u), connectors });
@@ -370,13 +415,7 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
   );
 
   const now = Date.now();
-  const preview = accounts.map((a) => ({
-    accountId: a.accountId,
-    name: a.name,
-    mask: a.mask,
-    type: a.type,
-    subtype: a.subtype,
-  }));
+  const preview = accounts.map(toAccountPreview);
 
   await ddb.putItem({
     ...metaKey(bank, e),
@@ -391,6 +430,8 @@ async function exchangeAndStore(bankId, { publicToken, email, metadata }) {
     institutionName,
     accountCount: accounts.length,
     accountsPreview: preview,
+    lastBalancesAt: now,
+    lastProbedAt: now,
     connectedAt: now,
     connectedBy: e,
     importTransactionsToDdb: false,
@@ -425,20 +466,17 @@ async function probeAccounts(bankId, { email } = {}) {
   const acctRes = await plaid.getAccounts(accessToken);
   const accounts = (acctRes.accounts || []).map(mapAccount);
   const meta = await getMeta(bank, e);
+  const now = Date.now();
+  const preview = accounts.map(toAccountPreview);
 
   if (meta) {
     await ddb.putItem({
       ...meta,
       accountCount: accounts.length,
-      accountsPreview: accounts.map((a) => ({
-        accountId: a.accountId,
-        name: a.name,
-        mask: a.mask,
-        type: a.type,
-        subtype: a.subtype,
-      })),
-      lastProbedAt: Date.now(),
-      updatedAt: Date.now(),
+      accountsPreview: preview,
+      lastBalancesAt: now,
+      lastProbedAt: now,
+      updatedAt: now,
     });
   }
 
@@ -449,8 +487,95 @@ async function probeAccounts(bankId, { email } = {}) {
     institutionName: meta?.institutionName || bank.name,
     itemId: meta?.itemId || acctRes.item?.item_id || null,
     accounts,
+    accountsPreview: preview,
+    lastBalancesAt: now,
     importTransactionsToDdb: false,
     source: 'plaid_live',
+  };
+}
+
+/**
+ * Cached accounts for Accounts UI — no live Plaid call.
+ * Falls back to empty when never connected / never probed.
+ */
+async function cachedAccounts(bankId, { email } = {}) {
+  const e = requireEmail(email);
+  await migrateLegacyForUser(e);
+  const bank = resolveBank(bankId);
+  const meta = await getMeta(bank, e);
+  const accessToken = await getAccessToken(bank, e);
+  const connected = !!(meta?.connected && accessToken);
+  const preview = meta?.accountsPreview || [];
+
+  return {
+    ok: true,
+    connectorId: bank.id,
+    email: e,
+    institutionName: meta?.institutionName || bank.name,
+    itemId: meta?.itemId || null,
+    connected,
+    accounts: preview.map((p) => ({
+      accountId: p.accountId,
+      name: p.name,
+      officialName: p.officialName || null,
+      mask: p.mask ?? null,
+      type: p.type ?? null,
+      subtype: p.subtype ?? null,
+      balances: {
+        available: p.available ?? null,
+        current: p.current ?? null,
+        limit: p.limit ?? null,
+        isoCurrencyCode: p.isoCurrencyCode || 'USD',
+      },
+    })),
+    accountsPreview: preview,
+    lastBalancesAt: meta?.lastBalancesAt || meta?.lastProbedAt || null,
+    importTransactionsToDdb: false,
+    source: 'connector_cache',
+  };
+}
+
+/**
+ * Refresh Plaid balances for every connected bank of this user and
+ * write them onto CONNECTOR meta (Accounts reads the cache next).
+ */
+async function refreshAllBalances({ email } = {}) {
+  const e = requireEmail(email);
+  await migrateLegacyForUser(e);
+  const results = [];
+  for (const id of Object.keys(BANKS)) {
+    const bank = resolveBank(id);
+    const accessToken = await getAccessToken(bank, e);
+    const meta = await getMeta(bank, e);
+    if (!meta?.connected || !accessToken) {
+      results.push({
+        connectorId: id,
+        skipped: true,
+        reason: 'not_connected',
+      });
+      continue;
+    }
+    try {
+      const probed = await probeAccounts(id, { email: e });
+      results.push({
+        connectorId: id,
+        ok: true,
+        accountCount: probed.accounts?.length ?? 0,
+        lastBalancesAt: probed.lastBalancesAt,
+      });
+    } catch (err) {
+      results.push({
+        connectorId: id,
+        ok: false,
+        error: err.message || String(err),
+      });
+    }
+  }
+  return {
+    ok: true,
+    email: e,
+    refreshedAt: Date.now(),
+    results,
   };
 }
 
@@ -509,6 +634,11 @@ module.exports = {
   listHousehold,
   exchangeAndStore,
   probeAccounts,
+  cachedAccounts,
+  refreshAllBalances,
+  toAccountPreview,
+  displayBalance,
+  isCreditType,
   disconnect,
   createLinkToken,
   migrateLegacyForUser,

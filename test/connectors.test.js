@@ -59,4 +59,31 @@ describe('Plaid / bank connector helpers', () => {
     }
     assert.equal(typeof configured, 'boolean');
   });
+
+  it('toAccountPreview keeps Plaid available/current for Accounts cache', () => {
+    const preview = connectors.toAccountPreview({
+      accountId: 'acc_1',
+      name: 'Checking',
+      officialName: 'Advantage Plus',
+      mask: '1234',
+      type: 'depository',
+      subtype: 'checking',
+      balances: {
+        available: 1200.5,
+        current: 1250,
+        limit: null,
+        isoCurrencyCode: 'USD',
+      },
+    });
+    assert.equal(preview.accountId, 'acc_1');
+    assert.equal(preview.available, 1200.5);
+    assert.equal(preview.current, 1250);
+    assert.equal(connectors.displayBalance(preview), 1200.5);
+    assert.equal(connectors.isCreditType('credit', 'credit card'), true);
+    assert.equal(connectors.isCreditType('depository', 'checking'), false);
+    assert.equal(
+      connectors.displayBalance({ available: null, current: 99 }),
+      99,
+    );
+  });
 });
