@@ -294,6 +294,19 @@ exports.handler = async (event) => {
       return respond(200, { pull, push });
     }
 
+    // Local-first clients: full snapshot or incremental changes since cursor.
+    // GET /v1/sync/changes?since=<epoch_ms>&full=0|1
+    if (method === 'GET' && path === '/v1/sync/changes') {
+      const qs = event?.queryStringParameters || {};
+      return respond(
+        200,
+        await sync.listChanges({
+          since: qs.since,
+          full: qs.full,
+        }),
+      );
+    }
+
     // Phone offline-first: land Room PENDING_PUSH into DDB. YNAB later via tick/schedule.
     if (method === 'POST' && path === '/v1/device/push') {
       return respond(200, await sync.devicePush(parseBody(event)));
@@ -400,12 +413,21 @@ exports.handler = async (event) => {
     }
 
     if (method === 'GET' && path === '/v1/transactions') {
+      // Optional since= for lightweight delta (prefer GET /v1/sync/changes).
+      const qs = event?.queryStringParameters || {};
+      const sinceMs = Math.max(0, Number(qs.since) || 0);
       const items = await ddb.queryPk(ddb.planPk(), 'TXN#');
-      // Map closed accounts if needed — return all non-deleted for hydrate
+      const filtered = items.filter((t) => {
+        if (sinceMs > 0) {
+          // Delta: include tombstones so clients can soft-delete locally.
+          return (Number(t.updatedAt) || 0) > sinceMs;
+        }
+        return !t.deleted;
+      });
       return respond(200, {
-        transactions: items
-          .filter((t) => !t.deleted)
-          .map((t) => sync.mapTxn(t)),
+        transactions: filtered.map((t) => sync.mapTxn(t)),
+        since: sinceMs || undefined,
+        mode: sinceMs > 0 ? 'delta' : 'full',
       });
     }
 

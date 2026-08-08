@@ -743,6 +743,8 @@ function mapTxn(t) {
     transferAccountId: p.transfer_account_id || null,
     transferTransactionId: p.transfer_transaction_id || null,
     importId: p.import_id || clientId || null,
+    deleted: !!(t.deleted || p.deleted),
+    updatedAt: t.updatedAt || 0,
     subtransactions: (p.subtransactions || []).map((s) => ({
       ynabId: s.id,
       amount: s.amount,
@@ -751,6 +753,136 @@ function mapTxn(t) {
       memo: s.memo || null,
       transferAccountId: s.transfer_account_id || null,
     })),
+  };
+}
+
+/**
+ * Local-first client sync: full snapshot or incremental changes since cursor.
+ *
+ * Query: GET /v1/sync/changes?since=<epoch_ms>&full=0|1
+ *
+ * - No since / since=0 / full=1 → mode "full" (live rows only; no tombstones)
+ * - since>0 → mode "delta" (rows with updatedAt > since, including deleted:true)
+ *
+ * Clients store `cursor` (serverTime) and pass it as the next `since`.
+ * HTTP payload stays small on day-to-day opens; occasional full resync heals drift.
+ *
+ * @param {{ since?: number|string, full?: boolean|string|number }} [opts]
+ */
+async function listChanges(opts = {}) {
+  const serverTime = Date.now();
+  const sinceMs = Math.max(0, Number(opts.since) || 0);
+  const forceFull =
+    opts.full === true ||
+    opts.full === 1 ||
+    opts.full === '1' ||
+    opts.full === 'true';
+  const mode = forceFull || !sinceMs ? 'full' : 'delta';
+  const planId = ledgerPlanId;
+
+  const [meta, accts, groups, cats, payees, txns] = await Promise.all([
+    ddb.getItem(ddb.planPk(planId), 'META'),
+    ddb.queryPk(ddb.planPk(planId), 'ACCT#'),
+    ddb.queryPk(ddb.planPk(planId), 'CGRP#'),
+    ddb.queryPk(ddb.planPk(planId), 'CAT#'),
+    ddb.queryPk(ddb.planPk(planId), 'PAYEE#'),
+    ddb.queryPk(ddb.planPk(planId), 'TXN#'),
+  ]);
+
+  const plan = {
+    name: meta?.payload?.name || meta?.name || 'Plan',
+    ynabPlanId: meta?.ynabPlanId || meta?.payload?.ynabPlanId,
+    currency: meta?.payload?.currency || 'USD',
+    serverKnowledge: meta?.serverKnowledge ?? 0,
+  };
+
+  const isChanged = (row) => {
+    if (mode === 'full') return true;
+    return (Number(row.updatedAt) || 0) > sinceMs;
+  };
+
+  const accounts = accts
+    .filter(isChanged)
+    .filter((a) => (mode === 'full' ? !a.deleted && !a.closed : true))
+    .map((i) => ({
+      ynabId: i.ynabId,
+      name: i.name,
+      type: i.type,
+      balance: i.balance ?? i.payload?.balance ?? 0,
+      onBudget: i.onBudget ?? i.payload?.on_budget ?? true,
+      closed: !!(i.closed ?? i.payload?.closed ?? false),
+      note: i.payload?.note ?? null,
+      transferPayeeId: i.payload?.transfer_payee_id ?? null,
+      deleted: !!i.deleted,
+      updatedAt: i.updatedAt || 0,
+    }));
+
+  const groupsOut = groups
+    .filter(isChanged)
+    .filter((g) => (mode === 'full' ? !g.deleted : true))
+    .map((g) => ({
+      ynabId: g.ynabId,
+      name: g.name,
+      hidden: g.hidden ?? false,
+      deleted: !!g.deleted,
+      updatedAt: g.updatedAt || 0,
+    }));
+
+  const { colorForCategory } = require('./categoryColors');
+  const categories = cats
+    .filter(isChanged)
+    .filter((c) => (mode === 'full' ? !c.deleted : true))
+    .map((c) => {
+      let color = c.color;
+      if (!color) {
+        color = colorForCategory({ name: c.name, ynabId: c.ynabId });
+      }
+      return {
+        ynabId: c.ynabId,
+        name: c.name,
+        categoryGroupId: c.categoryGroupId,
+        hidden: c.hidden ?? false,
+        color,
+        deleted: !!c.deleted,
+        updatedAt: c.updatedAt || 0,
+      };
+    });
+
+  const payeesOut = payees
+    .filter(isChanged)
+    .filter((p) => (mode === 'full' ? !p.deleted : true))
+    .map((p) => ({
+      ynabId: p.ynabId,
+      name: p.name,
+      transferAccountId:
+        p.transferAccountId ?? p.payload?.transfer_account_id ?? null,
+      deleted: !!p.deleted,
+      updatedAt: p.updatedAt || 0,
+    }));
+
+  const transactions = txns
+    .filter(isChanged)
+    .filter((t) => (mode === 'full' ? !t.deleted : true))
+    .map((t) => mapTxn(t));
+
+  return {
+    mode,
+    serverTime,
+    cursor: serverTime,
+    since: sinceMs,
+    plan,
+    accounts,
+    groups: groupsOut,
+    categories,
+    payees: payeesOut,
+    transactions,
+    counts: {
+      accounts: accounts.length,
+      groups: groupsOut.length,
+      categories: categories.length,
+      payees: payeesOut.length,
+      transactions: transactions.length,
+    },
   };
 }
 
@@ -1022,6 +1154,7 @@ module.exports = {
   categorizeTransaction,
   approveTransaction,
   listInbox,
+  listChanges,
   mapTxn,
   stats,
   uuid,

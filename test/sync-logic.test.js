@@ -64,6 +64,42 @@ describe('mapTxn stable client id', () => {
     assert.equal(mapped.id, 'ynab-1');
     assert.equal(mapped.ynabId, 'ynab-1');
   });
+
+  it('exposes deleted + updatedAt for client delta merge', () => {
+    const { mapTxn } = require('../src/lib/sync');
+    const mapped = mapTxn({
+      sk: 'TXN#gone',
+      ynabId: 'gone',
+      accountId: 'a',
+      date: '2026-01-01',
+      amount: 0,
+      deleted: true,
+      updatedAt: 1700000000000,
+      payload: { deleted: true },
+    });
+    assert.equal(mapped.deleted, true);
+    assert.equal(mapped.updatedAt, 1700000000000);
+  });
+});
+
+describe('listChanges export', () => {
+  it('is a function (full/delta client snapshot)', () => {
+    const { listChanges } = require('../src/lib/sync');
+    assert.equal(typeof listChanges, 'function');
+  });
+});
+
+describe('GET /v1/sync/changes route', () => {
+  it('requires session (not open, not 404)', async () => {
+    const { handler } = require('../src/handlers/apiHandler');
+    const res = await handler({
+      rawPath: '/v1/sync/changes',
+      requestContext: { http: { method: 'GET' } },
+      queryStringParameters: { since: '0' },
+    });
+    assert.equal(res.statusCode, 401);
+    assert.notEqual(res.statusCode, 404);
+  });
 });
 
 describe('device/push route exists', () => {
