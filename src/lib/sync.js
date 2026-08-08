@@ -5,6 +5,7 @@ const ynab = require('./ynab');
 const ddb = require('./ddb');
 const { ledgerPlanId } = require('./config');
 const { colorForCategory } = require('./categoryColors');
+const { pickEnrichment } = require('./plaidEnrich');
 
 /** Load existing category colors so re-import / delta never drifts user or assigned colors. */
 async function loadCategoryColorMap(planId) {
@@ -265,16 +266,26 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
     );
   }
 
+  // Preserve Plaid enrichment across full re-import.
+  const existingTxns = await ddb.queryPk(ddb.planPk(planId), 'TXN#');
+  const enrichBySk = new Map();
+  for (const row of existingTxns) {
+    const e = pickEnrichment(row);
+    if (Object.keys(e).length) enrichBySk.set(row.sk, e);
+  }
+
   for (const t of txnsR.transactions) {
+    const sk = `TXN#${t.id}`;
+    const kept = enrichBySk.get(sk) || {};
     if (t.deleted) {
       items.push(
         entityItem({
           planId,
-          sk: `TXN#${t.id}`,
+          sk,
           entityType: 'transaction',
           ynabId: t.id,
           payload: t,
-          extra: { deleted: true, accountId: t.account_id },
+          extra: { deleted: true, accountId: t.account_id, ...kept },
         }),
       );
       continue;
@@ -282,7 +293,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
     items.push(
       entityItem({
         planId,
-        sk: `TXN#${t.id}`,
+        sk,
         entityType: 'transaction',
         ynabId: t.id,
         payload: t,
@@ -296,6 +307,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
           cleared: t.cleared,
           memo: t.memo,
           deleted: false,
+          ...kept,
         },
       }),
     );
@@ -326,6 +338,14 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
   );
   const orphanedTombstoned = await reconcileMissingYnabTxns(planId, liveIds);
 
+  let plaidEnrich = null;
+  try {
+    plaidEnrich = await require('./plaidEnrich').enrichAfterPull();
+  } catch (e) {
+    plaidEnrich = { error: e.message };
+    console.warn('plaidEnrich after fullImport', e.message);
+  }
+
   return {
     planName: ynabPlan.name,
     ynabPlanId: ynabPlan.id,
@@ -344,6 +364,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
       orphanedTombstoned,
     },
     serverKnowledge: knowledge,
+    plaidEnrich,
   };
 }
 
@@ -450,6 +471,14 @@ async function deltaPull() {
     // Best-effort; proceed without skip set.
   }
 
+  // Preserve Plaid enrichment when YNAB overwrites the row.
+  const existingForEnrich = await ddb.queryPk(ddb.planPk(planId), 'TXN#');
+  const enrichBySk = new Map();
+  for (const row of existingForEnrich) {
+    const e = pickEnrichment(row);
+    if (Object.keys(e).length) enrichBySk.set(row.sk, e);
+  }
+
   let skippedPending = 0;
   for (const t of txnsR.transactions) {
     const sk = `TXN#${t.id}`;
@@ -457,6 +486,7 @@ async function deltaPull() {
       skippedPending += 1;
       continue;
     }
+    const kept = enrichBySk.get(sk) || {};
     items.push(
       entityItem({
         planId,
@@ -474,6 +504,7 @@ async function deltaPull() {
           cleared: t.cleared,
           memo: t.memo,
           deleted: !!t.deleted,
+          ...kept,
         },
       }),
     );
@@ -524,6 +555,15 @@ async function deltaPull() {
     updatedAt: Date.now(),
   });
 
+  let plaidEnrich = null;
+  try {
+    // Stamp new spends + inbox needs-attention with Plaid match/location.
+    plaidEnrich = await require('./plaidEnrich').enrichAfterPull();
+  } catch (e) {
+    plaidEnrich = { error: e.message };
+    console.warn('plaidEnrich after deltaPull', e.message);
+  }
+
   return {
     mode: 'delta',
     ynabPlanId,
@@ -531,6 +571,7 @@ async function deltaPull() {
     serverKnowledge: knowledge,
     itemsUpserted: items.length,
     skippedPendingPush: skippedPending,
+    plaidEnrich,
   };
 }
 
@@ -727,6 +768,7 @@ function mapTxn(t) {
   const clientId = t.clientId || p.client_id || null;
   const ynabId = t.ynabId || p.id || null;
   const stableId = clientId || ynabId || skId;
+  const enrich = pickEnrichment(t);
   return {
     id: stableId,
     clientId,
@@ -745,6 +787,20 @@ function mapTxn(t) {
     importId: p.import_id || clientId || null,
     deleted: !!(t.deleted || p.deleted),
     updatedAt: t.updatedAt || 0,
+    // Plaid match + location (optional; stamped by plaidEnrich)
+    plaidTransactionId: enrich.plaidTransactionId || null,
+    plaidMerchantName: enrich.plaidMerchantName || null,
+    plaidMerchantEntityId: enrich.plaidMerchantEntityId || null,
+    plaidPaymentChannel: enrich.plaidPaymentChannel || null,
+    plaidPfc: enrich.plaidPfc || null,
+    matchTier: enrich.matchTier || null,
+    matchConfidence: enrich.matchConfidence ?? null,
+    location: enrich.location || null,
+    locationSource: enrich.locationSource || null,
+    locationConfidence: enrich.locationConfidence ?? null,
+    /** UI string: "City, ST" (US) or "City, Country" (intl). */
+    locationDisplay: enrich.locationDisplay || null,
+    enrichedAt: enrich.enrichedAt || null,
     subtransactions: (p.subtransactions || []).map((s) => ({
       ynabId: s.id,
       amount: s.amount,
@@ -1005,6 +1061,8 @@ async function devicePush(body = {}) {
       gsi2pk: 'PENDING_PUSH',
       gsi2sk: `${String(updatedAt).padStart(15, '0')}#${base?.sk || sk}`,
       deviceCreate: isCreate || !!base?.deviceCreate,
+      // Keep Plaid location / match when phone re-saves categorize offline.
+      ...pickEnrichment(base),
     };
     await ddb.putItem(item);
     results.transactions.push({

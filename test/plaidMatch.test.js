@@ -9,6 +9,40 @@ const {
   nameScore,
   amountsAlign,
 } = require('../src/lib/plaidMatch');
+const { formatLocationDisplay } = require('../src/lib/plaidEnrich');
+
+describe('formatLocationDisplay', () => {
+  it('formats US as city, state', () => {
+    assert.equal(
+      formatLocationDisplay({
+        city: 'Los Gatos',
+        region: 'CA',
+        country: 'US',
+      }),
+      'Los Gatos, CA',
+    );
+  });
+  it('defaults missing country to US style', () => {
+    assert.equal(
+      formatLocationDisplay({ city: 'SeaTac', region: null }),
+      'SeaTac',
+    );
+    assert.equal(
+      formatLocationDisplay({ city: 'Kirkland', region: 'WA' }),
+      'Kirkland, WA',
+    );
+  });
+  it('formats non-US as city, country', () => {
+    assert.equal(
+      formatLocationDisplay({
+        city: 'Phu Quoc',
+        region: null,
+        country: 'Vietnam',
+      }),
+      'Phu Quoc, Vietnam',
+    );
+  });
+});
 
 describe('plaidMatch amountsAlign', () => {
   it('maps YNAB outflow milliunits to Plaid positive dollars', () => {

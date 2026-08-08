@@ -57,7 +57,8 @@ deploy_fn() {
 
 # Higher timeout/memory: full txn hydrate is ~3MB+ and DDB query of 7k+ rows.
 deploy_fn R2FinanceApiHandler src/handlers/apiHandler.handler 60 1024
-deploy_fn R2FinanceYnabPull src/handlers/ynabPull.handler 120 512
+# Pull + Plaid enrich (multi-bank transactions/get) can exceed 2 min
+deploy_fn R2FinanceYnabPull src/handlers/ynabPull.handler 180 1024
 deploy_fn R2FinanceYnabPush src/handlers/ynabPush.handler 60 256
 deploy_fn R2FinanceFullImport src/handlers/fullImport.handler 300 1024
 

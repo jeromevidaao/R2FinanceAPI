@@ -345,6 +345,28 @@ exports.handler = async (event) => {
       return respond(200, await sync.listInbox());
     }
 
+    // Stamp Plaid match + location on new spends / inbox (admin or any session).
+    if (method === 'POST' && path === '/v1/sync/enrich-plaid') {
+      const plaidEnrich = require('../lib/plaidEnrich');
+      const body = parseBody(event);
+      if (body?.inboxOnly) {
+        return respond(200, {
+          ok: true,
+          result: await plaidEnrich.enrichInboxNeedsAttention(body),
+        });
+      }
+      if (body?.newOnly) {
+        return respond(200, {
+          ok: true,
+          result: await plaidEnrich.enrichNewSpending(body),
+        });
+      }
+      return respond(200, {
+        ok: true,
+        result: await plaidEnrich.enrichAfterPull(body),
+      });
+    }
+
     if (method === 'GET' && path === '/v1/accounts') {
       const items = await ddb.queryPk(ddb.planPk(), 'ACCT#');
       return respond(200, {
