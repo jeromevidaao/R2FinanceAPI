@@ -5,8 +5,8 @@
   "description": "R2Finance AWS API — Lambda + DynamoDB + YNAB bidirectional sync",
   "main": "src/handlers/apiHandler.js",
   "scripts": {
-    "test": "node --test test/*.test.js",
-    "lint": "node -c src/lib/ynab.js && node -c src/lib/ddb.js && node -c src/lib/sync.js && node -c src/lib/categoryColors.js && node -c src/lib/displayPayee.js && node -c src/lib/secrets.js && node -c src/lib/ssm.js && node -c src/lib/plaid.js && node -c src/lib/plaidMatch.js && node -c src/lib/merchantLocation.js && node -c src/lib/plaidEnrich.js && node -c src/lib/connectors.js && node -c src/lib/fcm.js && node -c src/handlers/apiHandler.js && node -c src/handlers/ynabPull.js && node -c src/handlers/ynabPush.js && node -c src/handlers/fullImport.js",
+    "test": "node --test test/",
+    "lint": "node -c src/lib/ynab.js && node -c src/lib/ddb.js && node -c src/lib/sync.js && node -c src/lib/categoryColors.js && node -c src/lib/displayPayee.js && node -c src/lib/amazonOrders.js && node -c src/lib/secrets.js && node -c src/lib/ssm.js && node -c src/lib/plaid.js && node -c src/lib/plaidMatch.js && node -c src/lib/merchantLocation.js && node -c src/lib/plaidEnrich.js && node -c src/lib/connectors.js && node -c src/lib/fcm.js && node -c src/handlers/apiHandler.js && node -c src/handlers/ynabPull.js && node -c src/handlers/ynabPush.js && node -c src/handlers/fullImport.js",
     "deploy": "bash scripts/deploy.sh",
     "import": "bash scripts/invoke-import.sh"
   },

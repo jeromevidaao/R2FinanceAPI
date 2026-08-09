@@ -395,6 +395,46 @@ exports.handler = async (event) => {
       return respond(200, await sync.listInbox());
     }
 
+    // ── Amazon orders (Chrome extension scrape → DDB → inbox enrichment) ──
+    // POST body: { orders: [{ orderNumber, orderDate, grandTotal, items, orderUrl?, chargeRefs? }] }
+    if (method === 'POST' && path === '/v1/amazon/orders') {
+      const amazonOrders = require('../lib/amazonOrders');
+      const body = parseBody(event);
+      const orders = body.orders || body.items || [];
+      if (!Array.isArray(orders) || orders.length === 0) {
+        return respond(400, { error: 'orders array required' });
+      }
+      if (orders.length > 500) {
+        return respond(400, { error: 'max 500 orders per request' });
+      }
+      const result = await amazonOrders.upsertOrders(orders);
+      return respond(200, { ok: true, ...result });
+    }
+
+    if (method === 'GET' && path === '/v1/amazon/orders') {
+      const amazonOrders = require('../lib/amazonOrders');
+      const [orders, meta] = await Promise.all([
+        amazonOrders.listStoredOrders(),
+        amazonOrders.getMeta(),
+      ]);
+      return respond(200, {
+        ok: true,
+        count: orders.length,
+        lastSyncAt: meta?.lastSyncAt || null,
+        orders,
+      });
+    }
+
+    // Re-run amount/date/ref matching against stored Amazon orders.
+    if (method === 'POST' && path === '/v1/amazon/match') {
+      const amazonOrders = require('../lib/amazonOrders');
+      const body = parseBody(event);
+      const result = await amazonOrders.matchAndStampTransactions({
+        force: !!body?.force,
+      });
+      return respond(200, { ok: true, ...result });
+    }
+
     // Stamp Plaid match + location on new spends / inbox (admin or any session).
     if (method === 'POST' && path === '/v1/sync/enrich-plaid') {
       const plaidEnrich = require('../lib/plaidEnrich');
