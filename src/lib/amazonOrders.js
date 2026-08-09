@@ -27,7 +27,8 @@ function orderSk(orderNumber) {
 function orderUrlFor(orderNumber, domain = 'www.amazon.com') {
   const id = encodeURIComponent(String(orderNumber).trim());
   const host = String(domain || 'www.amazon.com').replace(/^https?:\/\//, '');
-  return `https://${host}/gp/your-account/order-details?orderID=${id}`;
+  // Modern Amazon order-details URL (legacy /gp/your-account/… still works).
+  return `https://${host}/your-orders/order-details?orderID=${id}`;
 }
 
 /**
