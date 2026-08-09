@@ -131,21 +131,36 @@ function normalizeIncomingOrder(raw) {
     raw.orderNumber || raw.order_id || raw.orderId || '',
   ).trim();
   if (!orderNumber) return null;
+  const junkItem =
+    /^(amazon\s+(secured|business|store|visa|mastercard|prime)\s*card|ending in\s*\d{4}|visa|mastercard|american express|discover)$/i;
   const items = Array.isArray(raw.items)
-    ? raw.items.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 40)
+    ? raw.items
+        .map((x) => String(x || '').trim())
+        .filter((t) => t && t.length >= 3 && t.length <= 300 && !junkItem.test(t))
+        .slice(0, 40)
     : [];
   const domain = raw.domain || raw.amazonDomain || 'www.amazon.com';
   const orderUrl =
     (raw.orderUrl || raw.order_url || '').trim() ||
     orderUrlFor(orderNumber, domain);
+  const junkRef =
+    /^(GARDEN|WINDOW|LENGTH|AMAZON|AMZN|METHODS|PAYMENT|TOTAL|ORDER|SHIPPING|RETURNED|REFUNDED|CARD|VISA|MASTER)$/i;
   const chargeRefs = Array.isArray(raw.chargeRefs || raw.paymentRefs)
     ? (raw.chargeRefs || raw.paymentRefs)
         .map((r) => String(r || '').trim().toUpperCase())
-        .filter(Boolean)
+        .filter(
+          (r) =>
+            r &&
+            r.length >= 5 &&
+            r.length <= 14 &&
+            !junkRef.test(r) &&
+            /\d/.test(r),
+        )
     : [];
   // Also accept a single chargeRef on the order.
   if (raw.chargeRef) {
-    chargeRefs.push(String(raw.chargeRef).trim().toUpperCase());
+    const r = String(raw.chargeRef).trim().toUpperCase();
+    if (r && !junkRef.test(r) && /\d/.test(r)) chargeRefs.push(r);
   }
   const grandTotalMilli =
     raw.grandTotalMilli != null
