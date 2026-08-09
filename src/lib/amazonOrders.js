@@ -409,35 +409,49 @@ function buildRefIndex(orders) {
 
 /**
  * Pick best order for a ledger txn.
- * Prefer charge-ref hit; else unique amount within date window.
+ *
+ * Charge refs like LR52S7I73 are often shared across many Amazon charges
+ * (same terminal / descriptor), so we never match on ref alone — amount must
+ * agree (±1¢). Prefer unique amount within date window otherwise.
  */
 function matchOrderForTxn(t, orders, byRef) {
+  const amt = Math.abs(Number(t.amount ?? t.payload?.amount ?? 0));
+  const txnDate = t.date || t.payload?.date;
   const ref = txnChargeRef(t);
-  if (ref && byRef.has(ref)) {
-    const cands = byRef.get(ref);
+
+  if (ref && byRef.has(ref) && amt) {
+    const cands = byRef.get(ref).filter((o) => {
+      if (o.grandTotalMilli == null) return false;
+      return Math.abs(o.grandTotalMilli - amt) <= 10;
+    });
     if (cands.length === 1) {
       return { order: cands[0], method: 'charge_ref' };
     }
-    // Disambiguate by amount/date among ref hits.
-    const amt = Math.abs(Number(t.amount ?? t.payload?.amount ?? 0));
-    let best = null;
-    let bestScore = Infinity;
-    for (const o of cands) {
-      const d = dateDiffDays(t.date || t.payload?.date, o.orderDate);
-      const amountGap =
-        o.grandTotalMilli != null ? Math.abs(o.grandTotalMilli - amt) : 5000;
-      const score = d * 1000 + amountGap;
-      if (score < bestScore) {
-        bestScore = score;
-        best = o;
+    if (cands.length > 1) {
+      let best = null;
+      let bestScore = Infinity;
+      for (const o of cands) {
+        const d = dateDiffDays(txnDate, o.orderDate);
+        if (d > DATE_WINDOW_DAYS) continue;
+        if (d < bestScore) {
+          bestScore = d;
+          best = o;
+        }
+      }
+      if (best != null && bestScore < Infinity) {
+        // Unique best date among amount-matched ref hits
+        const ties = cands.filter(
+          (o) => dateDiffDays(txnDate, o.orderDate) === bestScore,
+        );
+        const nums = new Set(ties.map((o) => o.orderNumber));
+        if (nums.size === 1) {
+          return { order: best, method: 'charge_ref' };
+        }
       }
     }
-    if (best) return { order: best, method: 'charge_ref' };
   }
 
-  const amt = Math.abs(Number(t.amount ?? t.payload?.amount ?? 0));
   if (!amt) return null;
-  const txnDate = t.date || t.payload?.date;
   /** @type {{ order: object, score: number }[]} */
   const scored = [];
   for (const o of orders) {
@@ -454,9 +468,7 @@ function matchOrderForTxn(t, orders, byRef) {
   const best = scored[0];
   const ties = scored.filter((s) => s.score === best.score);
   if (ties.length > 1) {
-    // Same day + same amount: still attach if only one order (already filtered).
-    // Multiple different orders same amount/day → skip.
-    const nums = new Set(ties.map((t) => t.order.orderNumber));
+    const nums = new Set(ties.map((x) => x.order.orderNumber));
     if (nums.size > 1) return null;
   }
   return { order: best.order, method: 'amount_date' };

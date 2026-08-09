@@ -64,7 +64,7 @@ describe('amazonOrders', () => {
     assert.match(o.orderUrl, /orderID=112-1234567-8901234/);
   });
 
-  it('matches by charge ref first', () => {
+  it('matches by charge ref when amount also agrees', () => {
     const orders = [
       {
         orderNumber: '111-1',
@@ -87,6 +87,69 @@ describe('amazonOrders', () => {
     );
     assert.equal(hit.method, 'charge_ref');
     assert.equal(hit.order.orderNumber, '111-1');
+  });
+
+  it('does not match charge ref alone when amounts differ (shared LR52 style)', () => {
+    // Same MKTPL descriptor appears on many different charges.
+    const orders = [
+      {
+        orderNumber: '111-1',
+        orderDate: '2026-02-01',
+        grandTotalMilli: 50000,
+        chargeRefs: ['LR52S7I73'],
+        items: ['Wrong order'],
+        orderUrl: orderUrlFor('111-1'),
+      },
+    ];
+    const byRef = new Map([['LR52S7I73', orders]]);
+    const hit = matchOrderForTxn(
+      {
+        amount: -19830,
+        date: '2026-02-12',
+        payload: { payee_name: 'AMAZON MKTPL*LR52S7I73' },
+      },
+      orders,
+      byRef,
+    );
+    assert.equal(hit, null);
+  });
+
+  it('end-to-end: amount/date match → enhance payee with items + ship', () => {
+    const orders = [
+      {
+        orderNumber: '113-9999999-0000001',
+        orderDate: '2026-02-11',
+        grandTotalMilli: 19830,
+        chargeRefs: [],
+        items: ['Anker USB-C Cable 6ft'],
+        itemsSummary: 'Anker USB-C Cable 6ft',
+        shipCity: 'Portland',
+        shipState: 'ME',
+        shipLocation: 'Portland, ME',
+        orderUrl: orderUrlFor('113-9999999-0000001'),
+      },
+    ];
+    const hit = matchOrderForTxn(
+      {
+        amount: -19830,
+        date: '2026-02-12',
+        payload: { payee_name: 'AMAZON MKTPL*LR52S7I73' },
+      },
+      orders,
+      new Map(),
+    );
+    assert.ok(hit);
+    assert.equal(hit.method, 'amount_date');
+    const stamp = {
+      amazonItemsSummary: hit.order.itemsSummary,
+      amazonShipCity: hit.order.shipCity,
+      amazonShipState: hit.order.shipState,
+      amazonShipLocation: hit.order.shipLocation,
+    };
+    assert.equal(
+      enhanceDisplayPayee('AMAZON MKTPL*LR52S7I73', stamp),
+      'AMAZON MKTPL*LR52S7I73 — Anker USB-C Cable 6ft · Portland, ME',
+    );
   });
 
   it('matches by amount + date when unique', () => {
