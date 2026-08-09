@@ -17,9 +17,82 @@ const ddb = require('./ddb');
 const { ledgerPlanId } = require('./config');
 const {
   normName,
+  nameScore,
   formatLocation,
   hasUsableLocation,
 } = require('./plaidMatch');
+
+/** Street line has a house/route number — not a bare POI business name. */
+function isStreetLikeAddress(s) {
+  const t = String(s || '').trim();
+  if (!t) return false;
+  if (/^-?\d{1,3}(?:\.\d+)?\s*,\s*-?\d{1,3}(?:\.\d+)?$/.test(t)) return false;
+  return /\d/.test(t);
+}
+
+/**
+ * Soft relatedness for payee vs geocoded POI label.
+ * Rejects "Don's Cafe" ↔ "Sister's cafe" (only generic "cafe" overlap).
+ */
+function placeNameRelated(a, b) {
+  const na = normName(a);
+  const nb = normName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.includes(nb) || nb.includes(na)) return true;
+  const score = nameScore(a, b);
+  if (score >= 0.5) return true;
+  // Distinctive non-generic token must match (avoid cafe/coffee-only hits).
+  const generic = new Set([
+    'cafe',
+    'coffee',
+    'restaurant',
+    'bar',
+    'grill',
+    'kitchen',
+    'bistro',
+    'shop',
+    'store',
+    'market',
+    'food',
+  ]);
+  const A = new Set(na.split(' ').filter((w) => w.length > 2));
+  const B = new Set(nb.split(' ').filter((w) => w.length > 2));
+  for (const t of A) {
+    if (B.has(t) && !generic.has(t)) return true;
+  }
+  return false;
+}
+
+/**
+ * Drop geocoded POI names that do not match the merchant (keep city/region).
+ * Street addresses always kept. Prevents Maps queries like
+ * "Don's Cafe Sister's cafe, Bellevue, WA".
+ */
+function sanitizeGeocodedLocation(loc, merchantName) {
+  if (!loc || typeof loc !== 'object') return null;
+  const addr = String(loc.address || '').trim();
+  if (!addr || isStreetLikeAddress(addr)) {
+    return formatLocation(loc) || loc;
+  }
+  if (!merchantName || placeNameRelated(merchantName, addr)) {
+    // Matching POI name — keep as label (or strip to avoid payee dup; keep for cache).
+    return formatLocation(loc) || loc;
+  }
+  // Wrong business name in address field — keep geo only.
+  const cleaned = {
+    address: null,
+    city: loc.city || null,
+    region: loc.region || null,
+    postal_code: loc.postal_code || null,
+    country: loc.country || null,
+    lat: loc.lat ?? null,
+    lon: loc.lon ?? null,
+    store_number: loc.store_number || null,
+  };
+  if (!hasUsableLocation(cleaned)) return null;
+  return formatLocation(cleaned) || cleaned;
+}
 
 const SK_ENTITY = 'MERCHANT#E#';
 const SK_NAME = 'MERCHANT#N#';
@@ -500,8 +573,14 @@ async function geocodeNominatim(query, { signal, limit = 3 } = {}) {
       const country = addr.country_code
         ? String(addr.country_code).toUpperCase()
         : addr.country || null;
+      // Prefer real street line over POI display-name head (often a wrong business).
+      const street = [addr.house_number, addr.road || addr.pedestrian || addr.footway]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+      const poiLabel = hit.name || hit.display_name?.split(',')[0] || null;
       return formatLocation({
-        address: hit.display_name?.split(',')[0] || null,
+        address: street || poiLabel || null,
         city,
         region,
         postal_code: addr.postcode || null,
@@ -539,8 +618,10 @@ async function geocodePhoton(query, { signal, limit = 3 } = {}) {
       const country = p.countrycode
         ? String(p.countrycode).toUpperCase()
         : p.country || null;
+      // Prefer street over POI name (name often mismatches the card merchant).
+      const street = [p.housenumber, p.street].filter(Boolean).join(' ').trim();
       return formatLocation({
-        address: p.name || p.street || null,
+        address: street || p.name || null,
         city,
         region,
         postal_code: p.postcode || null,
@@ -719,12 +800,15 @@ async function geocodeCandidates(candidates, cityPriors, { maxQueries = 14 } = {
         // eslint-disable-next-line no-await-in-loop
         await new Promise((r) => setTimeout(r, used === 1 ? 0 : 900));
         // eslint-disable-next-line no-await-in-loop
-        const loc = await geocodeQuery(q, cityPriors, { placeHint });
+        const rawLoc = await geocodeQuery(q, cityPriors, { placeHint });
+        const merchant = plaid.merchant_name || plaid.name;
+        // Strip mismatched POI names (Sister's cafe for Don's Cafe) — keep city.
+        const loc = sanitizeGeocodedLocation(rawLoc, merchant);
         if (loc && (loc.city || loc.lat != null)) {
           results.set(id, {
             location: loc,
             query: q,
-            merchant: plaid.merchant_name || plaid.name,
+            merchant,
           });
           if (mkey) seenMerchant.add(mkey);
           break;
@@ -758,6 +842,9 @@ module.exports = {
   userCityPriors,
   cityMatchesPrior,
   pickAcceptedLocation,
+  isStreetLikeAddress,
+  placeNameRelated,
+  sanitizeGeocodedLocation,
   geocodeNominatim,
   geocodePhoton,
   geocodeQuery,

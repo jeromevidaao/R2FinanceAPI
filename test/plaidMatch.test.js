@@ -14,6 +14,11 @@ const {
   amountsAlign,
 } = require('../src/lib/plaidMatch');
 const { formatLocationDisplay } = require('../src/lib/plaidEnrich');
+const {
+  isStreetLikeAddress,
+  placeNameRelated,
+  sanitizeGeocodedLocation,
+} = require('../src/lib/merchantLocation');
 
 describe('formatLocationDisplay', () => {
   it('formats US as city, state', () => {
@@ -55,6 +60,48 @@ describe('formatLocationDisplay', () => {
       }),
       'Phu Quoc, Vietnam',
     );
+  });
+});
+
+describe('geocode location sanitize (wrong POI)', () => {
+  it('detects street vs POI name', () => {
+    assert.equal(isStreetLikeAddress('1023 4th Ave'), true);
+    assert.equal(isStreetLikeAddress("Sister's cafe"), false);
+  });
+  it('rejects Don\'s Cafe vs Sister\'s cafe', () => {
+    assert.equal(placeNameRelated("Don's Cafe", "Sister's cafe"), false);
+    assert.equal(placeNameRelated("Don's Cafe", "Don's Cafe Bellevue"), true);
+  });
+  it('strips mismatched POI address, keeps city', () => {
+    const cleaned = sanitizeGeocodedLocation(
+      {
+        address: "Sister's cafe",
+        city: 'Bellevue',
+        region: 'WA',
+        postal_code: '98005',
+        country: 'US',
+        lat: 47.6,
+        lon: -122.15,
+      },
+      "Don's Cafe",
+    );
+    assert.ok(cleaned);
+    assert.equal(cleaned.address, null);
+    assert.equal(cleaned.city, 'Bellevue');
+    assert.ok(!String(cleaned.text || '').toLowerCase().includes('sister'));
+  });
+  it('keeps real street address', () => {
+    const cleaned = sanitizeGeocodedLocation(
+      {
+        address: '1023 4th Ave',
+        city: 'Bellevue',
+        region: 'WA',
+        country: 'US',
+      },
+      "Don's Cafe",
+    );
+    assert.ok(cleaned);
+    assert.equal(cleaned.address, '1023 4th Ave');
   });
 });
 
