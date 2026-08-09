@@ -10,6 +10,7 @@ const {
   parseImportPayeeName,
   resolveDisplayPayee,
 } = require('./displayPayee');
+const amazonOrders = require('./amazonOrders');
 
 /** Load existing category colors so re-import / delta never drifts user or assigned colors. */
 async function loadCategoryColorMap(planId) {
@@ -1358,6 +1359,8 @@ function mapTxn(t) {
   // Plaid match + location (optional; stamped by plaidEnrich)
   if (enrich.plaidTransactionId) out.plaidTransactionId = enrich.plaidTransactionId;
   if (enrich.plaidMerchantName) out.plaidMerchantName = enrich.plaidMerchantName;
+  if (enrich.plaidName) out.plaidName = enrich.plaidName;
+  if (enrich.plaidDescription) out.plaidDescription = enrich.plaidDescription;
   if (enrich.plaidMerchantEntityId) {
     out.plaidMerchantEntityId = enrich.plaidMerchantEntityId;
   }
@@ -1374,6 +1377,8 @@ function mapTxn(t) {
   }
   if (enrich.locationDisplay) out.locationDisplay = enrich.locationDisplay;
   if (enrich.enrichedAt) out.enrichedAt = enrich.enrichedAt;
+  // Amazon order enrichment (stamped by chrome extension → DDB match).
+  amazonOrders.attachAmazonFields(out, t);
   const subs = (p.subtransactions || [])
     .map((s) => {
       const sub = { amount: s.amount };
@@ -1786,16 +1791,22 @@ async function listInbox() {
       payeeName: namedPayee,
       transferAccountName: transferAlias || transferYnabName,
       plaidMerchantName: t.plaidMerchantName || null,
+      plaidName: t.plaidName || null,
+      plaidDescription: t.plaidDescription || null,
       plaidPfc: t.plaidPfc || null,
       importPayeeName: t.importPayeeName || null,
       accounts: accountsForPayee,
     });
+    const payeeWithAmazon = amazonOrders.enhanceDisplayPayee(
+      displayPayee || namedPayee || null,
+      t,
+    );
     out.push({
       ...t,
       accountName: alias || ynabName,
       accountAlias: alias || null,
       accountMask: extractAccountMask(ynabName),
-      payeeName: displayPayee || namedPayee || null,
+      payeeName: payeeWithAmazon || namedPayee || null,
       reason,
       onBudget,
     });

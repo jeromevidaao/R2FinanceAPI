@@ -398,10 +398,23 @@ function attachLocations(matchResult, locationCache, opts = {}) {
  * Store as optional top-level fields on TXN# or a side entity ENRICH#TXN#id.
  */
 function enrichmentRecord(matchWithLocation) {
+  const rawName =
+    matchWithLocation.plaid.name ||
+    matchWithLocation.plaid.merchant_name ||
+    null;
+  const parsed = parseVenmoPlaidName(rawName);
+  const merchantOrName =
+    matchWithLocation.plaid.merchant_name ||
+    matchWithLocation.plaid.name ||
+    null;
+  // Prefer "Person - note" for Venmo-style names so UI can show description.
+  const displayName =
+    (parsed && parsed.display) || merchantOrName || null;
   return {
     plaidTransactionId: matchWithLocation.plaid.transaction_id,
-    plaidMerchantName:
-      matchWithLocation.plaid.merchant_name || matchWithLocation.plaid.name,
+    plaidMerchantName: displayName,
+    plaidName: rawName,
+    plaidDescription: parsed ? parsed.display : null,
     plaidMerchantEntityId: matchWithLocation.plaid.merchant_entity_id,
     plaidPaymentChannel: matchWithLocation.plaid.payment_channel,
     matchTier: matchWithLocation.tier,
@@ -411,6 +424,187 @@ function enrichmentRecord(matchWithLocation) {
     locationConfidence: matchWithLocation.locationConfidence,
     matchedAt: new Date().toISOString(),
   };
+}
+
+/** True when bank/import payee is a generic Venmo ACH label (no real person/note). */
+function isGenericVenmoLabel(text) {
+  const s = String(text || '').trim();
+  if (!s) return false;
+  if (/^venmo$/i.test(s)) return true;
+  if (/^venmo\b/i.test(s) && /payment|cashout|des:|web id|ppd|orig/i.test(s)) {
+    return true;
+  }
+  return false;
+}
+
+/** Ledger row looks like a Venmo bank feed (payee / import / plaid stamp). */
+function isVenmoLikeLedger(row) {
+  const blob = [
+    row.payeeName,
+    row.importPayeeName,
+    row.memo,
+    row.plaidMerchantName,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return /\bvenmo\b/i.test(blob);
+}
+
+/**
+ * Parse Plaid Venmo `name` into counterparty + note.
+ * Examples:
+ *   Richard Mondor "City bags" → { name, note, display: "Richard Mondor - City bags" }
+ *   Fire wood → { name: "Fire wood", note: null, display: "Fire wood" }
+ *   Standard transfer → { name: "Standard transfer", note: null, display: "Standard transfer" }
+ */
+function parseVenmoPlaidName(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  // Person "note" (straight or curly quotes)
+  const m = s.match(/^(.+?)\s+["“](.+?)["”]\s*$/);
+  if (m) {
+    const name = m[1].trim();
+    const note = m[2].trim();
+    if (name && note) {
+      return { name, note, display: `${name} - ${note}` };
+    }
+  }
+  // "note" only
+  const onlyNote = s.match(/^["“](.+?)["”]\s*$/);
+  if (onlyNote) {
+    const note = onlyNote[1].trim();
+    return { name: null, note, display: note };
+  }
+  return { name: s, note: null, display: s };
+}
+
+/**
+ * Cross-match bank "Venmo" ledger rows to the Venmo Personal Plaid item.
+ * Bank ACH only says "Venmo"; the note lives on the Venmo connector
+ * (e.g. Richard Mondor "City bags"). Match by amount + date only (masks differ).
+ *
+ * @param {Array} ledgerRows  same shape as matchLedgerToPlaid
+ * @param {Array} plaidTxns
+ * @param {Map|Object} plaidAccountById  account_id → { mask, name, bankId }
+ * @param {{ maxDays?: number, minConfidence?: number }} opts
+ * @returns {Map<string, object>} ynabId → match result (same shape as matchLedgerToPlaid)
+ */
+function matchVenmoDescriptions(
+  ledgerRows,
+  plaidTxns,
+  plaidAccountById,
+  opts = {},
+) {
+  const maxDays = opts.maxDays ?? 2;
+  const getAcct = (id) => {
+    if (!plaidAccountById) return null;
+    if (plaidAccountById instanceof Map) return plaidAccountById.get(id);
+    return plaidAccountById[id];
+  };
+
+  const venmoPlaid = (plaidTxns || []).filter((pt) => {
+    const acct = getAcct(pt.account_id);
+    if (acct?.bankId === 'venmo') return true;
+    // Fallback: institution not on account map — detect by name shape / category
+    const cat = (pt.category || []).join(' ').toLowerCase();
+    if (cat.includes('venmo')) return true;
+    const n = String(pt.name || '');
+    if (/"/.test(n) || /“/.test(n)) return true;
+    return false;
+  });
+
+  // Prefer rows that look like Venmo; if bankId filter found none, try all for venmo-like ledger
+  const candidates = (ledgerRows || []).filter(isVenmoLikeLedger);
+  const usedPlaid = new Set();
+  const matches = new Map();
+
+  // Greedy: exact day first, rarer amounts first
+  const ordered = [...candidates].sort((a, b) => {
+    const aa = Math.abs(ynabToDollars(a.amount));
+    const bb = Math.abs(ynabToDollars(b.amount));
+    return aa - bb || String(a.date).localeCompare(String(b.date));
+  });
+
+  for (const L of ordered) {
+    const cands = [];
+    for (const pt of venmoPlaid) {
+      if (usedPlaid.has(pt.transaction_id)) continue;
+      const amt = amountsAlign(L.amount, pt.amount);
+      if (!amt.ok) continue;
+      const { days, field } = bestDateDelta(L.date, pt);
+      if (days > maxDays) continue;
+      // Prefer person "note" over bare Standard transfer when both align
+      const parsed = parseVenmoPlaidName(pt.name);
+      const richness =
+        parsed?.note ? 2 : /standard\s+transfer/i.test(pt.name || '') ? 0 : 1;
+      cands.push({ pt, days, field, richness, amt });
+    }
+    if (!cands.length) continue;
+    cands.sort(
+      (a, b) =>
+        a.days - b.days ||
+        b.richness - a.richness ||
+        (a.pt.pending ? 1 : 0) - (b.pt.pending ? 1 : 0),
+    );
+    const best = cands[0];
+    usedPlaid.add(best.pt.transaction_id);
+    const rawName = best.pt.name || best.pt.merchant_name || null;
+    const parsed = parseVenmoPlaidName(rawName);
+    const confidence =
+      best.days === 0 ? 0.94 : best.days <= 1 ? 0.88 : 0.78;
+    matches.set(L.ynabId, {
+      ynabId: L.ynabId,
+      tier: best.days === 0 ? 'V0' : best.days <= 1 ? 'V1' : 'V2',
+      confidence,
+      dateDeltaDays: Math.round(best.days * 10) / 10,
+      dateField: best.field,
+      nameScore: 1,
+      venmoDescription: true,
+      plaid: {
+        transaction_id: best.pt.transaction_id,
+        account_id: best.pt.account_id,
+        accountMask: null,
+        accountName: 'Venmo',
+        date: best.pt.date,
+        authorized_date: best.pt.authorized_date || null,
+        amount: best.pt.amount,
+        name: rawName,
+        merchant_name: best.pt.merchant_name || null,
+        merchant_entity_id: best.pt.merchant_entity_id || null,
+        pending: !!best.pt.pending,
+        pending_transaction_id: best.pt.pending_transaction_id || null,
+        payment_channel: best.pt.payment_channel || null,
+        personal_finance_category:
+          best.pt.personal_finance_category?.primary || null,
+        website: best.pt.website || null,
+      },
+      rawPlaid: best.pt,
+      parsed,
+    });
+  }
+
+  return matches;
+}
+
+/**
+ * Human label for UI: "Person - note" from stamped enrich fields.
+ */
+function formatVenmoDescriptionLabel({
+  plaidDescription,
+  plaidName,
+  plaidMerchantName,
+} = {}) {
+  if (plaidDescription && String(plaidDescription).trim()) {
+    return String(plaidDescription).trim();
+  }
+  for (const candidate of [plaidName, plaidMerchantName]) {
+    const parsed = parseVenmoPlaidName(candidate);
+    if (parsed?.display && !isGenericVenmoLabel(parsed.display)) {
+      return parsed.display;
+    }
+  }
+  return null;
 }
 
 module.exports = {
@@ -427,4 +621,9 @@ module.exports = {
   attachLocations,
   enrichmentRecord,
   amountsAlign,
+  isGenericVenmoLabel,
+  isVenmoLikeLedger,
+  parseVenmoPlaidName,
+  matchVenmoDescriptions,
+  formatVenmoDescriptionLabel,
 };

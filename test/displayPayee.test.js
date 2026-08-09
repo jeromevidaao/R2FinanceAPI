@@ -113,4 +113,16 @@ describe('displayPayee', () => {
   it('returns null when nothing known', () => {
     assert.equal(resolveDisplayPayee({ accounts }), null);
   });
+
+  it('replaces generic Venmo payee with Personal note description', () => {
+    assert.equal(
+      resolveDisplayPayee({
+        payeeName: 'Venmo',
+        plaidDescription: 'Richard Mondor - City bags',
+        plaidName: 'Richard Mondor "City bags"',
+        accounts,
+      }),
+      'Richard Mondor - City bags',
+    );
+  });
 });

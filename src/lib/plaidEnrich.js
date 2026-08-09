@@ -15,11 +15,15 @@ const {
   extractMask,
   buildMerchantLocationCache,
   matchLedgerToPlaid,
+  matchVenmoDescriptions,
   attachLocations,
   resolveLocation,
   enrichmentRecord,
   formatLocation,
   ynabToDollars,
+  isVenmoLikeLedger,
+  isGenericVenmoLabel,
+  parseVenmoPlaidName,
 } = require('./plaidMatch');
 const merchantLocation = require('./merchantLocation');
 
@@ -27,6 +31,8 @@ const merchantLocation = require('./merchantLocation');
 const ENRICH_FIELDS = [
   'plaidTransactionId',
   'plaidMerchantName',
+  'plaidName',
+  'plaidDescription',
   'plaidMerchantEntityId',
   'plaidPaymentChannel',
   'plaidPfc',
@@ -428,6 +434,11 @@ function enrichmentFromMatch(matchWithLoc) {
   return {
     plaidTransactionId: base.plaidTransactionId,
     plaidMerchantName: base.plaidMerchantName || null,
+    plaidName: base.plaidName || matchWithLoc.plaid?.name || null,
+    plaidDescription:
+      base.plaidDescription ||
+      parseVenmoPlaidName(matchWithLoc.plaid?.name)?.display ||
+      null,
     plaidMerchantEntityId: base.plaidMerchantEntityId || null,
     plaidPaymentChannel: base.plaidPaymentChannel || null,
     plaidPfc: formatPfc(matchWithLoc.plaid?.personal_finance_category),
@@ -570,7 +581,24 @@ async function enrichTxnRows(ddbRows, opts = {}) {
 
   let candidates = ddbRows.filter((t) => t && !t.deleted);
   if (onlyMissing) {
-    candidates = candidates.filter((t) => !t.plaidTransactionId);
+    candidates = candidates.filter((t) => {
+      if (!t.plaidTransactionId) return true;
+      // Already matched bank ACH as "Venmo" — still try Venmo Personal note.
+      if (t.plaidDescription && !isGenericVenmoLabel(t.plaidDescription)) {
+        return false;
+      }
+      const p = t.payload || {};
+      const probe = {
+        payeeName: p.payee_name || null,
+        importPayeeName: p.import_payee_name || t.importPayeeName || null,
+        memo: t.memo ?? p.memo ?? null,
+        plaidMerchantName: t.plaidMerchantName || null,
+      };
+      return (
+        isVenmoLikeLedger(probe) &&
+        (isGenericVenmoLabel(t.plaidMerchantName) || !t.plaidDescription)
+      );
+    });
   }
   if (spendingOnly) {
     candidates = candidates.filter((t) => {
@@ -611,19 +639,26 @@ async function enrichTxnRows(ddbRows, opts = {}) {
     payeeMap.set(id, p.name || p.payload?.name || null);
   }
 
-  // Only rows on connected bank masks
+  // Bank-mask rows for standard Plaid match + Venmo-like rows (often mask-less
+  // BoA aliases) for Venmo Personal description overlay.
   const ledgerRows = [];
+  const venmoLedgerRows = [];
   const rowByYnab = new Map();
   for (const t of candidates) {
     const L = ledgerRowFromDdb(t, acctMap, payeeMap);
+    // Carry existing stamp so isVenmoLikeLedger sees plaidMerchantName=Venmo
+    L.plaidMerchantName = t.plaidMerchantName || null;
     if (!L.ynabId || !L.date || L.amount == null) continue;
     if (L.transferAccountId) continue;
-    if (!L.accountMask || !pool.masks.has(L.accountMask)) continue;
-    ledgerRows.push(L);
+    const onMask = L.accountMask && pool.masks.has(L.accountMask);
+    const venmoLike = isVenmoLikeLedger(L);
+    if (!onMask && !venmoLike) continue;
     rowByYnab.set(L.ynabId, t);
+    if (onMask) ledgerRows.push(L);
+    if (venmoLike) venmoLedgerRows.push(L);
   }
 
-  if (!ledgerRows.length) {
+  if (!ledgerRows.length && !venmoLedgerRows.length) {
     return {
       attempted: candidates.length,
       matched: 0,
@@ -634,11 +669,46 @@ async function enrichTxnRows(ddbRows, opts = {}) {
     };
   }
 
-  const matchResult = matchLedgerToPlaid(
-    ledgerRows,
+  const matchResult = ledgerRows.length
+    ? matchLedgerToPlaid(
+        ledgerRows,
+        pool.plaidTxns,
+        pool.plaidAccountById,
+      )
+    : {
+        matches: new Map(),
+        tierCounts: {},
+        matched: 0,
+        total: 0,
+        rate: 0,
+      };
+
+  // Overlay: bank "Venmo" ACH → Venmo Personal note (Person "memo").
+  // Prefer this description even when bank Plaid already matched as "Venmo".
+  const venmoMatches = matchVenmoDescriptions(
+    venmoLedgerRows.length ? venmoLedgerRows : ledgerRows,
     pool.plaidTxns,
     pool.plaidAccountById,
+    { maxDays: 2 },
   );
+  for (const [ynabId, vm] of venmoMatches) {
+    const existing = matchResult.matches.get(ynabId);
+    const existingName =
+      existing?.plaid?.merchant_name || existing?.plaid?.name || '';
+    const shouldUpgrade =
+      !existing ||
+      isGenericVenmoLabel(existingName) ||
+      isGenericVenmoLabel(rowByYnab.get(ynabId)?.plaidMerchantName);
+    if (shouldUpgrade) {
+      matchResult.matches.set(ynabId, vm);
+    }
+  }
+  if (venmoMatches.size) {
+    matchResult.tierCounts = matchResult.tierCounts || {};
+    matchResult.tierCounts.venmoDesc = venmoMatches.size;
+    matchResult.matched = matchResult.matches.size;
+  }
+
   // offerGeocode true → mark candidates; we may fill via Nominatim below
   const located = attachLocations(matchResult, pool.locationCache, {
     offerGeocode: true,
@@ -665,6 +735,7 @@ async function enrichTxnRows(ddbRows, opts = {}) {
 
   let matched = 0;
   let withLocation = 0;
+  let venmoDescribed = 0;
   const now = Date.now();
   const writes = [];
 
@@ -685,6 +756,9 @@ async function enrichTxnRows(ddbRows, opts = {}) {
     writes.push(item);
     matched += 1;
     if (clean.locationDisplay || clean.location) withLocation += 1;
+    if (clean.plaidDescription && !isGenericVenmoLabel(clean.plaidDescription)) {
+      venmoDescribed += 1;
+    }
   }
 
   if (writes.length) await ddb.batchWrite(writes);
@@ -699,9 +773,10 @@ async function enrichTxnRows(ddbRows, opts = {}) {
   }
 
   return {
-    attempted: ledgerRows.length,
+    attempted: Math.max(ledgerRows.length, venmoLedgerRows.length),
     matched,
     withLocation,
+    venmoDescribed,
     geocoded: geoStats.geocoded || 0,
     geocodeQueries: geoStats.queriesUsed || 0,
     merchantPersisted,
@@ -730,7 +805,22 @@ async function enrichNewSpending({ days = 45 } = {}) {
     const amt = t.amount ?? t.payload?.amount;
     // Prefer outflows for "spending"; still enrich refunds/inflows on same masks
     if (amt == null) return false;
-    return !t.plaidTransactionId;
+    if (!t.plaidTransactionId) return true;
+    // Upgrade generic bank "Venmo" stamps with Personal connector notes.
+    if (t.plaidDescription && !isGenericVenmoLabel(t.plaidDescription)) {
+      return false;
+    }
+    const p = t.payload || {};
+    const probe = {
+      payeeName: p.payee_name || null,
+      importPayeeName: p.import_payee_name || t.importPayeeName || null,
+      memo: t.memo ?? p.memo ?? null,
+      plaidMerchantName: t.plaidMerchantName || null,
+    };
+    return (
+      isVenmoLikeLedger(probe) &&
+      (isGenericVenmoLabel(t.plaidMerchantName) || !t.plaidDescription)
+    );
   });
   const result = await enrichTxnRows(recent, {
     days: days + 5,

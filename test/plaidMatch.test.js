@@ -4,6 +4,10 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   matchLedgerToPlaid,
+  matchVenmoDescriptions,
+  parseVenmoPlaidName,
+  isGenericVenmoLabel,
+  isVenmoLikeLedger,
   attachLocations,
   buildMerchantLocationCache,
   nameScore,
@@ -300,5 +304,72 @@ describe('merchantLocation helpers', () => {
     assert.equal(placeHintFromName('Singapore Food Street').country, 'SG');
     assert.equal(placeHintFromName('Jumbo Seafood Gallery').country, 'SG');
     assert.equal(placeHintFromName("Don's Cafe"), null);
+  });
+});
+
+describe('Venmo description parse + match', () => {
+  it('parses Person "note" into name - note display', () => {
+    const p = parseVenmoPlaidName('Richard Mondor "City bags"');
+    assert.equal(p.name, 'Richard Mondor');
+    assert.equal(p.note, 'City bags');
+    assert.equal(p.display, 'Richard Mondor - City bags');
+  });
+
+  it('detects generic Venmo bank labels', () => {
+    assert.equal(isGenericVenmoLabel('Venmo'), true);
+    assert.equal(isGenericVenmoLabel('VENMO PAYMENT 123 WEB ID: 1'), true);
+    assert.equal(isGenericVenmoLabel('Richard Mondor - City bags'), false);
+  });
+
+  it('flags venmo-like ledger rows', () => {
+    assert.equal(
+      isVenmoLikeLedger({ payeeName: 'Venmo', importPayeeName: null }),
+      true,
+    );
+    assert.equal(
+      isVenmoLikeLedger({ payeeName: "Don's Cafe" }),
+      false,
+    );
+  });
+
+  it('matches bank Venmo ACH to Venmo Personal by amount+date', () => {
+    const accounts = new Map([
+      ['v1', { mask: null, name: 'Personal Profile', bankId: 'venmo' }],
+      ['b1', { mask: '6803', name: 'Checkin', bankId: 'boa' }],
+    ]);
+    const ledger = [
+      {
+        ynabId: 'y-venmo',
+        date: '2026-08-04',
+        amount: -19000,
+        payeeName: 'Venmo',
+        importPayeeName: 'Venmo',
+        accountMask: '6803',
+      },
+    ];
+    const plaid = [
+      {
+        transaction_id: 'pt-venmo',
+        account_id: 'v1',
+        date: '2026-08-04',
+        amount: 19,
+        name: 'Richard Mondor "City bags"',
+        merchant_name: null,
+        category: ['Transfer', 'Third Party', 'Venmo'],
+      },
+      {
+        transaction_id: 'pt-bank',
+        account_id: 'b1',
+        date: '2026-08-04',
+        amount: 19,
+        name: 'Venmo',
+        merchant_name: 'Venmo',
+      },
+    ];
+    const matches = matchVenmoDescriptions(ledger, plaid, accounts);
+    assert.equal(matches.size, 1);
+    const m = matches.get('y-venmo');
+    assert.equal(m.plaid.name, 'Richard Mondor "City bags"');
+    assert.equal(m.parsed.display, 'Richard Mondor - City bags');
   });
 });
