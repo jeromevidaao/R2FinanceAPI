@@ -151,4 +151,16 @@ describe('amazonOrders', () => {
     assert.equal(o.shipState, 'ME');
     assert.equal(o.shipLocation, 'Portland, ME');
   });
+
+  it('heals full-address shipCity into City, ST', () => {
+    const o = normalizeIncomingOrder({
+      orderNumber: '112-1234567-8901234',
+      shipCity: 'Richard Mondor 53 PINE ST APT 1F PORTLAND ME',
+      shipState: null,
+      items: ['Widget'],
+    });
+    assert.equal(o.shipCity, 'Portland');
+    assert.equal(o.shipState, 'ME');
+    assert.equal(o.shipLocation, 'Portland, ME');
+  });
 });

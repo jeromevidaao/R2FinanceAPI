@@ -131,13 +131,78 @@ function summarizeItems(items, max = 3) {
  */
 function formatShipLocation(city, state, preformatted) {
   if (preformatted != null && String(preformatted).trim()) {
-    return String(preformatted).trim().replace(/\s+/g, ' ');
+    const pre = String(preformatted).trim().replace(/\s+/g, ' ');
+    // Only trust short "City, ST" preformatted values — not full streets.
+    if (pre.length <= 40 && !/\d/.test(pre)) return pre;
   }
   const c = city != null ? String(city).trim().replace(/\s+/g, ' ') : '';
   const st = state != null ? String(state).trim().toUpperCase() : '';
-  if (c && st) return `${c}, ${st}`;
-  if (c) return c;
-  if (st) return st;
+  if (c && st && c.length <= 32 && !/\d/.test(c)) return `${c}, ${st}`;
+  if (c && c.length <= 32 && !/\d/.test(c)) return c;
+  if (st && /^[A-Z]{2}$/.test(st)) return st;
+  return null;
+}
+
+const US_STATES = new Set(
+  'AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC'.split(
+    ' ',
+  ),
+);
+
+/**
+ * Heal scrapes that put the whole address into shipCity
+ * e.g. "Richard Mondor 53 PINE ST APT 1F PORTLAND ME" → Portland, ME
+ */
+function titleCaseCity(city) {
+  return String(city)
+    .toLowerCase()
+    .replace(/\b[a-z]/g, (c) => c.toUpperCase());
+}
+
+function healShipCityState(cityBlob, stateHint) {
+  const s = String(cityBlob || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const noise =
+    /^(st|ave|avenue|street|road|rd|blvd|ln|dr|way|apt|suite|ste|ne|nw|se|sw|n|s|e|w|to)$/i;
+
+  // Prefer last single-word city before a US state: "... PORTLAND ME"
+  let last = null;
+  for (const m of s.matchAll(
+    /\b([A-Za-z][A-Za-z.'\-]{2,24})\s+([A-Z]{2})(?:\s+\d{5})?(?=\s|$)/gi,
+  )) {
+    const city = m[1].trim();
+    const st = m[2].toUpperCase();
+    if (!US_STATES.has(st) || noise.test(city) || /\d/.test(city)) continue;
+    last = { shipCity: titleCaseCity(city), shipState: st };
+  }
+  if (last) return last;
+
+  // Comma form
+  const m = s.match(/\b([A-Za-z][A-Za-z.'\-\s]{1,28}?),?\s*([A-Z]{2})\s*$/i);
+  if (m && US_STATES.has(m[2].toUpperCase()) && !/\d/.test(m[1])) {
+    const words = m[1]
+      .replace(/,/g, '')
+      .trim()
+      .split(/\s+/)
+      .filter((w) => w && !noise.test(w));
+    const city = words.slice(-2).join(' ');
+    if (city.length >= 2 && city.length <= 32) {
+      return { shipCity: titleCaseCity(city), shipState: m[2].toUpperCase() };
+    }
+  }
+
+  if (
+    stateHint &&
+    US_STATES.has(String(stateHint).toUpperCase()) &&
+    s.length <= 32 &&
+    !/\d/.test(s) &&
+    !noise.test(s)
+  ) {
+    return {
+      shipCity: titleCaseCity(s),
+      shipState: String(stateHint).toUpperCase(),
+    };
+  }
   return null;
 }
 
@@ -186,36 +251,33 @@ function normalizeIncomingOrder(raw) {
     raw.shipCity || raw.shippingCity || raw.deliveryCity || null;
   const shipStateRaw =
     raw.shipState || raw.shippingState || raw.deliveryState || null;
-  const shipLocation = formatShipLocation(
-    shipCityRaw,
-    shipStateRaw,
-    raw.shipLocation || raw.shippingLocation || raw.deliveryLocation,
-  );
-  // Prefer structured city/state when we can split a "City, ST" string.
+  // Prefer structured city/state; heal bad scrapes like full address lines.
   let shipCity =
     shipCityRaw != null ? String(shipCityRaw).trim().replace(/\s+/g, ' ') : null;
   let shipState =
     shipStateRaw != null
-      ? String(shipStateRaw).trim().toUpperCase().slice(0, 2)
+      ? String(shipStateRaw).trim().toUpperCase()
       : null;
-  if ((!shipCity || !shipState) && shipLocation) {
-    const m = shipLocation.match(
-      /^(.+?),\s*([A-Z]{2})\s*$/i,
-    );
-    if (m) {
-      shipCity = shipCity || m[1].trim();
-      shipState = shipState || m[2].toUpperCase();
+  if (shipState && shipState.length > 2) {
+    shipState = shipState.slice(0, 2);
+  }
+  // If city looks like a full street address, re-extract trailing City ST.
+  if (shipCity && (shipCity.length > 28 || /\d/.test(shipCity) || !shipState)) {
+    const healed = healShipCityState(shipCity, shipState);
+    if (healed) {
+      shipCity = healed.shipCity;
+      shipState = healed.shipState;
+    } else if (shipCity.length > 28 || /\d/.test(shipCity)) {
+      shipCity = null;
     }
   }
   if (shipCity && !shipCity.length) shipCity = null;
-  if (shipState && !/^[A-Z]{2}$/.test(shipState)) {
-    // Keep longer region names (e.g. non-US) as-is in location only.
-    if (shipState.length > 2) {
-      /* leave shipState for location via formatShipLocation */
-    } else {
-      shipState = null;
-    }
-  }
+  if (shipState && !/^[A-Z]{2}$/.test(shipState)) shipState = null;
+  const shipLocation = formatShipLocation(
+    shipCity,
+    shipState,
+    raw.shipLocation || raw.shippingLocation || raw.deliveryLocation,
+  );
   return {
     orderNumber,
     orderDate: normalizeOrderDate(raw.orderDate || raw.date || raw.order_date),
@@ -548,6 +610,7 @@ module.exports = {
   parseMoneyToMilli,
   summarizeItems,
   formatShipLocation,
+  healShipCityState,
   normalizeIncomingOrder,
   listStoredOrders,
   upsertOrders,
