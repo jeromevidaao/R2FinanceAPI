@@ -140,14 +140,24 @@ function isGenericVenmoPayee(text) {
  * Only returns labels that look like Venmo Personal (quoted note or
  * "Name - note" from our enrich stamp) — never raw bank merchant strings.
  */
+function looksLikeVenmoPersonalDesc(s) {
+  const t = String(s || '').trim();
+  if (!t || isGenericVenmoPayee(t)) return false;
+  // Person "note"
+  if (/^(.+?)\s+["“](.+?)["”]\s*$/.test(t)) return true;
+  // Stamped "Person - note" (Title Case person, not ALL-CAPS merchant - CITY)
+  if (/^[A-Z][a-z]+(?:\s+[A-Z][a-z'.-]+)+\s-\s\S/.test(t)) return true;
+  if (/standard\s+transfer/i.test(t)) return true;
+  return false;
+}
+
 function venmoDescriptionLabel({
   plaidDescription,
   plaidName,
   plaidMerchantName,
 } = {}) {
-  if (plaidDescription && String(plaidDescription).trim()) {
-    const d = String(plaidDescription).trim();
-    if (!isGenericVenmoPayee(d)) return d;
+  if (plaidDescription && looksLikeVenmoPersonalDesc(plaidDescription)) {
+    return String(plaidDescription).trim();
   }
   for (const raw of [plaidName, plaidMerchantName]) {
     if (!raw || isGenericVenmoPayee(raw)) continue;
@@ -155,7 +165,7 @@ function venmoDescriptionLabel({
     // Person "note" → Person - note (Venmo Personal style)
     const m = s.match(/^(.+?)\s+["“](.+?)["”]\s*$/);
     if (m) return `${m[1].trim()} - ${m[2].trim()}`;
-    // Already stamped "Person - note" (must include " - " and look personal)
+    // Already stamped "Person - note"
     if (/\s-\s/.test(s) && !/^venmo\b/i.test(s)) return s;
   }
   return null;

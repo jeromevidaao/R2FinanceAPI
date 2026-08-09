@@ -16,6 +16,12 @@ Disallowed for cost:
 
 - Always-on compute, NAT Gateway, RDS, ElastiCache, multi-region
 
+## Amazon order enrichment
+
+- Chrome extension `amazon-orders-extension` scrapes amazon.com (browser session) daily
+- `POST /v1/amazon/orders` → DDB `sk=AMAZON#ORDER#…` + match stamp on `TXN#…`
+- Clients show item titles + order link on inbox payees (`AMAZON MKTPL*… — items`)
+
 ## Estimated personal use
 
 Near free tier / a few dollars per month at single-user volume if:

@@ -8,7 +8,10 @@
  * like "AMAZON MKTPL*LR52S7I73" / "Amazon.com*RN0L04R61" to order items + URL.
  */
 
-const ddb = require('./ddb');
+// Lazy-load AWS/DDB so pure helpers stay unit-testable without side effects.
+function ddb() {
+  return require('./ddb');
+}
 const { ledgerPlanId } = require('./config');
 const { parseImportPayeeName } = require('./displayPayee');
 
@@ -165,7 +168,8 @@ function normalizeIncomingOrder(raw) {
 }
 
 async function listStoredOrders(planId = ledgerPlanId) {
-  const rows = await ddb.queryPk(ddb.planPk(planId), ORDER_SK_PREFIX);
+  const db = ddb();
+  const rows = await db.queryPk(db.planPk(planId), ORDER_SK_PREFIX);
   return rows
     .filter((r) => !r.deleted)
     .map((r) => ({
@@ -193,7 +197,7 @@ async function upsertOrders(ordersInput, { planId = ledgerPlanId } = {}) {
     const o = normalizeIncomingOrder(raw);
     if (!o) continue;
     items.push({
-      pk: ddb.planPk(planId),
+      pk: `PLAN#${planId}`,
       sk: orderSk(o.orderNumber),
       entityType: 'amazon_order',
       orderNumber: o.orderNumber,
@@ -209,11 +213,16 @@ async function upsertOrders(ordersInput, { planId = ledgerPlanId } = {}) {
       deleted: false,
     });
   }
+  const db = ddb();
   if (items.length) {
-    await ddb.batchWrite(items);
+    // Rewrite pk with real plan helper (ddb may not be loaded at normalize time).
+    for (const it of items) {
+      it.pk = db.planPk(planId);
+    }
+    await db.batchWrite(items);
   }
-  await ddb.putItem({
-    pk: ddb.planPk(planId),
+  await db.putItem({
+    pk: db.planPk(planId),
     sk: META_SK,
     entityType: 'amazon_meta',
     lastSyncAt: now,
@@ -338,7 +347,8 @@ async function matchAndStampTransactions({
     return { matched: 0, considered: 0, orders: 0 };
   }
   const byRef = buildRefIndex(orders);
-  const txns = await ddb.queryPk(ddb.planPk(planId), 'TXN#');
+  const db = ddb();
+  const txns = await db.queryPk(db.planPk(planId), 'TXN#');
   let considered = 0;
   let matched = 0;
   const writes = [];
@@ -369,7 +379,7 @@ async function matchAndStampTransactions({
   }
 
   if (writes.length) {
-    await ddb.batchWrite(writes);
+    await db.batchWrite(writes);
   }
   return { matched, considered, orders: orders.length, stamped: writes.length };
 }
@@ -414,7 +424,8 @@ function enhanceDisplayPayee(base, amazon) {
 }
 
 async function getMeta(planId = ledgerPlanId) {
-  return (await ddb.getItem(ddb.planPk(planId), META_SK)) || null;
+  const db = ddb();
+  return (await db.getItem(db.planPk(planId), META_SK)) || null;
 }
 
 module.exports = {

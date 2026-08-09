@@ -434,11 +434,8 @@ function enrichmentFromMatch(matchWithLoc) {
   return {
     plaidTransactionId: base.plaidTransactionId,
     plaidMerchantName: base.plaidMerchantName || null,
-    plaidName: base.plaidName || matchWithLoc.plaid?.name || null,
-    plaidDescription:
-      base.plaidDescription ||
-      parseVenmoPlaidName(matchWithLoc.plaid?.name)?.display ||
-      null,
+    plaidName: base.plaidName || null,
+    plaidDescription: base.plaidDescription || null,
     plaidMerchantEntityId: base.plaidMerchantEntityId || null,
     plaidPaymentChannel: base.plaidPaymentChannel || null,
     plaidPfc: formatPfc(matchWithLoc.plaid?.personal_finance_category),

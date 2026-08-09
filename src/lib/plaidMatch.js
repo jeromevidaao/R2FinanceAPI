@@ -407,14 +407,23 @@ function enrichmentRecord(matchWithLocation) {
     matchWithLocation.plaid.merchant_name ||
     matchWithLocation.plaid.name ||
     null;
-  // Prefer "Person - note" for Venmo-style names so UI can show description.
-  const displayName =
-    (parsed && parsed.display) || merchantOrName || null;
+  // Only treat as Venmo description when we have a personal note or explicit
+  // Venmo Personal match — never stamp every merchant name as plaidDescription.
+  const isVenmoDesc =
+    !!matchWithLocation.venmoDescription ||
+    !!(parsed && parsed.note) ||
+    (matchWithLocation.plaid?.accountName === 'Venmo' &&
+      parsed &&
+      parsed.display &&
+      !isGenericVenmoLabel(parsed.display));
+  const displayName = isVenmoDesc
+    ? parsed?.display || merchantOrName
+    : merchantOrName;
   return {
     plaidTransactionId: matchWithLocation.plaid.transaction_id,
-    plaidMerchantName: displayName,
-    plaidName: rawName,
-    plaidDescription: parsed ? parsed.display : null,
+    plaidMerchantName: displayName || null,
+    plaidName: isVenmoDesc ? rawName : null,
+    plaidDescription: isVenmoDesc ? parsed?.display || null : null,
     plaidMerchantEntityId: matchWithLocation.plaid.merchant_entity_id,
     plaidPaymentChannel: matchWithLocation.plaid.payment_channel,
     matchTier: matchWithLocation.tier,
@@ -503,15 +512,11 @@ function matchVenmoDescriptions(
     return plaidAccountById[id];
   };
 
+  // Only the Venmo Personal connector (bankId=venmo). Do NOT include bank ACH
+  // rows whose Plaid category is "Venmo" — those only say "Venmo" with no note.
   const venmoPlaid = (plaidTxns || []).filter((pt) => {
     const acct = getAcct(pt.account_id);
-    if (acct?.bankId === 'venmo') return true;
-    // Fallback: institution not on account map — detect by name shape / category
-    const cat = (pt.category || []).join(' ').toLowerCase();
-    if (cat.includes('venmo')) return true;
-    const n = String(pt.name || '');
-    if (/"/.test(n) || /“/.test(n)) return true;
-    return false;
+    return acct?.bankId === 'venmo';
   });
 
   // Prefer rows that look like Venmo; if bankId filter found none, try all for venmo-like ledger
