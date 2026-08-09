@@ -125,6 +125,22 @@ function summarizeItems(items, max = 3) {
   return s;
 }
 
+/**
+ * Normalize delivery place for payee lines: "Portland, ME".
+ * Accepts shipCity + shipState, or a preformatted shipLocation.
+ */
+function formatShipLocation(city, state, preformatted) {
+  if (preformatted != null && String(preformatted).trim()) {
+    return String(preformatted).trim().replace(/\s+/g, ' ');
+  }
+  const c = city != null ? String(city).trim().replace(/\s+/g, ' ') : '';
+  const st = state != null ? String(state).trim().toUpperCase() : '';
+  if (c && st) return `${c}, ${st}`;
+  if (c) return c;
+  if (st) return st;
+  return null;
+}
+
 function normalizeIncomingOrder(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const orderNumber = String(
@@ -166,6 +182,40 @@ function normalizeIncomingOrder(raw) {
     raw.grandTotalMilli != null
       ? Math.abs(Number(raw.grandTotalMilli))
       : parseMoneyToMilli(raw.grandTotal ?? raw.total ?? raw.amount);
+  const shipCityRaw =
+    raw.shipCity || raw.shippingCity || raw.deliveryCity || null;
+  const shipStateRaw =
+    raw.shipState || raw.shippingState || raw.deliveryState || null;
+  const shipLocation = formatShipLocation(
+    shipCityRaw,
+    shipStateRaw,
+    raw.shipLocation || raw.shippingLocation || raw.deliveryLocation,
+  );
+  // Prefer structured city/state when we can split a "City, ST" string.
+  let shipCity =
+    shipCityRaw != null ? String(shipCityRaw).trim().replace(/\s+/g, ' ') : null;
+  let shipState =
+    shipStateRaw != null
+      ? String(shipStateRaw).trim().toUpperCase().slice(0, 2)
+      : null;
+  if ((!shipCity || !shipState) && shipLocation) {
+    const m = shipLocation.match(
+      /^(.+?),\s*([A-Z]{2})\s*$/i,
+    );
+    if (m) {
+      shipCity = shipCity || m[1].trim();
+      shipState = shipState || m[2].toUpperCase();
+    }
+  }
+  if (shipCity && !shipCity.length) shipCity = null;
+  if (shipState && !/^[A-Z]{2}$/.test(shipState)) {
+    // Keep longer region names (e.g. non-US) as-is in location only.
+    if (shipState.length > 2) {
+      /* leave shipState for location via formatShipLocation */
+    } else {
+      shipState = null;
+    }
+  }
   return {
     orderNumber,
     orderDate: normalizeOrderDate(raw.orderDate || raw.date || raw.order_date),
@@ -179,6 +229,10 @@ function normalizeIncomingOrder(raw) {
     chargeRefs: [...new Set(chargeRefs)],
     domain: String(domain).replace(/^https?:\/\//, ''),
     currency: raw.currency || 'USD',
+    shipCity: shipCity || null,
+    shipState: shipState || null,
+    shipLocation:
+      formatShipLocation(shipCity, shipState, shipLocation) || null,
   };
 }
 
@@ -196,6 +250,12 @@ async function listStoredOrders(planId = ledgerPlanId) {
       orderUrl: r.orderUrl || orderUrlFor(r.orderNumber, r.domain),
       chargeRefs: r.chargeRefs || [],
       domain: r.domain || 'www.amazon.com',
+      shipCity: r.shipCity || null,
+      shipState: r.shipState || null,
+      shipLocation:
+        r.shipLocation ||
+        formatShipLocation(r.shipCity, r.shipState) ||
+        null,
       updatedAt: r.updatedAt || 0,
     }));
 }
@@ -224,6 +284,9 @@ async function upsertOrders(ordersInput, { planId = ledgerPlanId } = {}) {
       chargeRefs: o.chargeRefs,
       domain: o.domain,
       currency: o.currency,
+      shipCity: o.shipCity,
+      shipState: o.shipState,
+      shipLocation: o.shipLocation,
       updatedAt: now,
       deleted: false,
     });
@@ -338,12 +401,19 @@ function matchOrderForTxn(t, orders, byRef) {
 }
 
 function stampFieldsFromOrder(order, method) {
+  const shipLocation =
+    order.shipLocation ||
+    formatShipLocation(order.shipCity, order.shipState) ||
+    null;
   return {
     amazonOrderNumber: order.orderNumber,
     amazonOrderUrl: order.orderUrl || orderUrlFor(order.orderNumber, order.domain),
     amazonItems: order.items || [],
     amazonItemsSummary:
       order.itemsSummary || summarizeItems(order.items) || null,
+    amazonShipCity: order.shipCity || null,
+    amazonShipState: order.shipState || null,
+    amazonShipLocation: shipLocation,
     amazonMatchedAt: Date.now(),
     amazonMatchMethod: method,
   };
@@ -376,12 +446,13 @@ async function matchAndStampTransactions({
     const hit = matchOrderForTxn(raw, orders, byRef);
     if (!hit) continue;
     const stamp = stampFieldsFromOrder(hit.order, hit.method);
-    // Skip write when already stamped with same order + items (unless force).
+    // Skip write when already stamped with same order + items + ship (unless force).
     if (
       !force &&
       raw.amazonOrderNumber === stamp.amazonOrderNumber &&
       raw.amazonOrderUrl === stamp.amazonOrderUrl &&
-      raw.amazonItemsSummary === stamp.amazonItemsSummary
+      raw.amazonItemsSummary === stamp.amazonItemsSummary &&
+      (raw.amazonShipLocation || null) === (stamp.amazonShipLocation || null)
     ) {
       continue;
     }
@@ -414,6 +485,17 @@ function attachAmazonFields(mapped, ddbRow) {
   if (ddbRow.amazonItemsSummary) {
     mapped.amazonItemsSummary = ddbRow.amazonItemsSummary;
   }
+  if (ddbRow.amazonShipCity) mapped.amazonShipCity = ddbRow.amazonShipCity;
+  if (ddbRow.amazonShipState) mapped.amazonShipState = ddbRow.amazonShipState;
+  if (ddbRow.amazonShipLocation) {
+    mapped.amazonShipLocation = ddbRow.amazonShipLocation;
+  } else {
+    const loc = formatShipLocation(
+      ddbRow.amazonShipCity,
+      ddbRow.amazonShipState,
+    );
+    if (loc) mapped.amazonShipLocation = loc;
+  }
   if (ddbRow.amazonMatchMethod) {
     mapped.amazonMatchMethod = ddbRow.amazonMatchMethod;
   }
@@ -421,8 +503,8 @@ function attachAmazonFields(mapped, ddbRow) {
 }
 
 /**
- * Append item titles to a display payee label.
- *   "AMAZON MKTPL*LR52S7I73" → "AMAZON MKTPL*LR52S7I73 — USB-C Cable, …"
+ * Append item titles + delivery city/state to a display payee label.
+ *   "AMAZON MKTPL*LR52S7I73" → "AMAZON MKTPL*LR52S7I73 — USB-C Cable · Portland, ME"
  */
 function enhanceDisplayPayee(base, amazon) {
   if (!amazon) return base;
@@ -430,12 +512,24 @@ function enhanceDisplayPayee(base, amazon) {
     amazon.amazonItemsSummary ||
     summarizeItems(amazon.amazonItems) ||
     null;
-  if (!summary) return base;
+  const loc =
+    amazon.amazonShipLocation ||
+    formatShipLocation(amazon.amazonShipCity, amazon.amazonShipState) ||
+    null;
+  if (!summary && !loc) return base;
   const label = (base && String(base).trim()) || 'Amazon';
-  if (label.includes(summary)) return label;
-  // Avoid double-append on re-render.
-  if (/ — /.test(label) && /amazon/i.test(label)) return label;
-  return `${label} — ${summary}`;
+  const hasSummary = summary && label.includes(summary);
+  const hasLoc = loc && label.includes(loc);
+  if (hasSummary && (hasLoc || !loc)) return label;
+  if (hasLoc && !summary) return label;
+  // Already enhanced with items (re-render): append location only.
+  if (/ — /.test(label) && /amazon/i.test(label)) {
+    if (loc && !label.includes(loc)) return `${label} · ${loc}`;
+    return label;
+  }
+  if (summary && loc) return `${label} — ${summary} · ${loc}`;
+  if (summary) return `${label} — ${summary}`;
+  return `${label} · ${loc}`;
 }
 
 async function getMeta(planId = ledgerPlanId) {
@@ -453,6 +547,7 @@ module.exports = {
   isAmazonRetailTxn,
   parseMoneyToMilli,
   summarizeItems,
+  formatShipLocation,
   normalizeIncomingOrder,
   listStoredOrders,
   upsertOrders,

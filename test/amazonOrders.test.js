@@ -122,4 +122,33 @@ describe('amazonOrders', () => {
       'AMAZON MKTPL*LR52S7I73 — USB-C Cable, HDMI Adapter',
     );
   });
+
+  it('enhances display payee with items + ship city/state', () => {
+    assert.equal(
+      enhanceDisplayPayee('AMAZON MKTPL*LR52S7I73', {
+        amazonItemsSummary: 'USB-C Cable',
+        amazonShipCity: 'Portland',
+        amazonShipState: 'ME',
+      }),
+      'AMAZON MKTPL*LR52S7I73 — USB-C Cable · Portland, ME',
+    );
+    assert.equal(
+      enhanceDisplayPayee('Amazon.com*RN0L04R61', {
+        amazonShipLocation: 'Seattle, WA',
+      }),
+      'Amazon.com*RN0L04R61 · Seattle, WA',
+    );
+  });
+
+  it('normalizes ship city/state on incoming orders', () => {
+    const o = normalizeIncomingOrder({
+      orderNumber: '112-1234567-8901234',
+      shipCity: 'Portland',
+      shipState: 'me',
+      items: ['Widget'],
+    });
+    assert.equal(o.shipCity, 'Portland');
+    assert.equal(o.shipState, 'ME');
+    assert.equal(o.shipLocation, 'Portland, ME');
+  });
 });
