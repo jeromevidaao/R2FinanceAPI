@@ -298,6 +298,76 @@ describe('matchedCounterpartTombstones', () => {
     assert.equal(items.length, 0);
   });
 
+  it('hides a non-transfer import that points at a live transfer (inbound match)', () => {
+    const items = matchedCounterpartTombstones('default', [
+      {
+        id: 'xfer',
+        transfer_account_id: 'ink',
+        transfer_transaction_id: 'xfer-in',
+        account_id: 'checkin',
+        amount: -1088130,
+        approved: true,
+        deleted: false,
+      },
+      {
+        id: 'pending-ghost',
+        matched_transaction_id: 'xfer',
+        account_id: 'checkin',
+        amount: -1088130,
+        approved: false,
+        deleted: false,
+      },
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].sk, 'TXN#pending-ghost');
+    assert.equal(items[0].deleted, true);
+    assert.equal(items[0].payload._tombstone, 'ghost_transfer_import');
+    assert.equal(items[0].payload._ghost_of_transfer_id, 'xfer');
+  });
+
+  it('hides both pending and posted imports next to a transfer (YNAB quad bug)', () => {
+    const items = matchedCounterpartTombstones('default', [
+      {
+        id: 'xfer',
+        matched_transaction_id: 'posted-ghost',
+        transfer_account_id: 'ink',
+        transfer_transaction_id: 'xfer-in',
+        account_id: 'checkin',
+        amount: -1088130,
+        approved: true,
+        deleted: false,
+      },
+      {
+        id: 'posted-ghost',
+        matched_transaction_id: 'xfer',
+        account_id: 'checkin',
+        amount: -1088130,
+        approved: false,
+        deleted: false,
+      },
+      {
+        id: 'pending-ghost',
+        matched_transaction_id: 'xfer',
+        account_id: 'checkin',
+        amount: -1088130,
+        approved: false,
+        deleted: false,
+      },
+      {
+        id: 'xfer-in',
+        transfer_account_id: 'checkin',
+        transfer_transaction_id: 'xfer',
+        account_id: 'ink',
+        amount: 1088130,
+        approved: true,
+        deleted: false,
+      },
+    ]);
+    const ids = items.map((i) => i.ynabId).sort();
+    assert.deepEqual(ids, ['pending-ghost', 'posted-ghost']);
+    assert.ok(items.every((i) => i.deleted && i.payload._tombstone === 'ghost_transfer_import'));
+  });
+
   it('skips pending-push counterpart keys', () => {
     const pending = new Set(['TXN#import-1']);
     const items = matchedCounterpartTombstones(
@@ -446,7 +516,24 @@ describe('ghostTransferImportTombstones', () => {
     assert.equal(items[0].ynabId, 'import-lag');
   });
 
-  it('ignores date gaps larger than 1 day', () => {
+  it('allows ACH pending vs posted lag up to 5 days', () => {
+    const ghost = {
+      id: 'import-ach-lag',
+      account_id: checkin,
+      date: '2026-08-10',
+      amount,
+      approved: false,
+      category_id: null,
+    };
+    const items = ghostTransferImportTombstones('default', [
+      ghost,
+      ...transferPair('2026-08-07'),
+    ]);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].ynabId, 'import-ach-lag');
+  });
+
+  it('ignores date gaps larger than 5 days', () => {
     const ghost = {
       id: 'import-far',
       account_id: checkin,
