@@ -590,6 +590,32 @@ describe('ghostTransferImportTombstones', () => {
     assert.equal(items.length, 0);
   });
 
+  it('ddbTxnToYnabShape keeps matched_transaction_id for inbound ghost scan', () => {
+    const { ddbTxnToYnabShape } = require('../src/lib/sync');
+    const shaped = ddbTxnToYnabShape({
+      sk: 'TXN#pending-ghost',
+      ynabId: 'pending-ghost',
+      payload: {
+        id: 'pending-ghost',
+        matched_transaction_id: 'xfer',
+        transfer_account_id: null,
+      },
+    });
+    assert.equal(shaped.matched_transaction_id, 'xfer');
+  });
+
+  it('dedupeItemsBySk last write wins', () => {
+    const { dedupeItemsBySk } = require('../src/lib/sync');
+    const out = dedupeItemsBySk([
+      { sk: 'TXN#a', deleted: false },
+      { sk: 'TXN#b', deleted: false },
+      { sk: 'TXN#a', deleted: true },
+    ]);
+    assert.equal(out.length, 2);
+    const a = out.find((i) => i.sk === 'TXN#a');
+    assert.equal(a.deleted, true);
+  });
+
   it('dateDiffDays handles ISO dates', () => {
     assert.equal(dateDiffDays('2026-08-07', '2026-08-08'), 1);
     assert.equal(dateDiffDays('2026-08-07', '2026-08-07'), 0);

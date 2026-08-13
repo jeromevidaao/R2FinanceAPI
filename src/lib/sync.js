@@ -448,6 +448,19 @@ function autoApproveUnapprovedTransferLegs(
   return out;
 }
 
+/**
+ * Last-write-wins by SK so BatchWriteItem never sees duplicate keys
+ * (live YNAB row + tombstone / auto-approve for the same TXN#).
+ */
+function dedupeItemsBySk(items) {
+  const bySk = new Map();
+  for (const item of items || []) {
+    if (!item || item.sk == null) continue;
+    bySk.set(item.sk, item);
+  }
+  return [...bySk.values()];
+}
+
 /** Absolute day difference between two ISO date strings (YYYY-MM-DD). */
 function dateDiffDays(a, b) {
   if (!a || !b) return Infinity;
@@ -477,6 +490,7 @@ function ddbTxnToYnabShape(row) {
     category_id: row.categoryId ?? p.category_id ?? null,
     transfer_account_id: p.transfer_account_id || null,
     transfer_transaction_id: p.transfer_transaction_id || null,
+    matched_transaction_id: p.matched_transaction_id || null,
     deleted: !!(row.deleted || p.deleted),
     import_id: p.import_id || null,
     payee_id: row.payeeId ?? p.payee_id ?? null,
@@ -802,7 +816,7 @@ async function fullImport({ sinceDate = '1990-01-01' } = {}) {
     );
   }
 
-  await ddb.batchWrite(items);
+  await ddb.batchWrite(dedupeItemsBySk(items));
 
   // Safety net: any leftover DDB TXN with a ynabId not in this snapshot (e.g.
   // matched imports missed by delta) → soft-delete so inbox matches YNAB.
@@ -1040,7 +1054,7 @@ async function deltaPull() {
     );
   }
 
-  if (items.length) await ddb.batchWrite(items);
+  if (items.length) await ddb.batchWrite(dedupeItemsBySk(items));
 
   await ddb.putItem(
     entityItem({
@@ -2259,4 +2273,5 @@ module.exports = {
   ddbTxnToYnabShape,
   mergeLedgerForGhostScan,
   reconcileMissingYnabTxns,
+  dedupeItemsBySk,
 };
